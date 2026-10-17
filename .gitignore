@@ -1,0 +1,16 @@
+# ESP-IDF build output and generated files
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# Visual Studio Code / CMake helper files
+.vscode/c_cpp_properties.json
+.vscode/compile_commands.json
+.vscode/launch.json
+.vscode/settings.json.bak
+
+# Python
+__pycache__/
+*.pyc

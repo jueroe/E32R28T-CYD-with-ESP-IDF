@@ -1,0 +1,9 @@
+## Managed components, downloaded into managed_components/ on the first build
+dependencies:
+  idf: ">=5.2"
+
+  ## ILI9341 LCD panel driver (esp_lcd), v2.x targets ESP-IDF v6
+  espressif/esp_lcd_ili9341: "^2.1.0"
+
+  ## XPT2046 touch driver on top of esp_lcd_touch
+  atanisoft/esp_lcd_touch_xpt2046: "^1.0.6"

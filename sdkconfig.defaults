@@ -1,0 +1,18 @@
+# Board: QDtech / LCDWiki 2.8inch ESP32-32E Display (E32R28T)
+# Module: ESP32-D0WD-V3, 4 MB flash, 520 KB SRAM, no PSRAM
+
+CONFIG_IDF_TARGET="esp32"
+
+# The module carries 4 MB of flash; the ESP-IDF default is 2 MB
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Full 240 MHz for smooth drawing into the framebuffer
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# XPT2046: the default pressure threshold of 400 is only ~30 counts below the
+# lightest corner touch measured on this panel (bottom left, Z ~430), so the
+# touch would drop out with slightly less pressure.  The untouched panel reads
+# near 0, so 250 keeps a good margin on both sides.  Keep this in sync with
+# BOARD_TOUCH_Z_THRESHOLD in main/board_e32r28t.h.
+CONFIG_XPT2046_Z_THRESHOLD=250
