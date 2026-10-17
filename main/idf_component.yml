@@ -7,3 +7,10 @@ dependencies:
 
   ## XPT2046 touch driver on top of esp_lcd_touch
   atanisoft/esp_lcd_touch_xpt2046: "^1.0.6"
+
+  ## littlefs for the wallpaper partition ("storage"), also provides the
+  ## littlefs_create_partition_image() CMake helper
+  joltwallet/littlefs: "^1.23.0"
+
+  ## BME280 temperature/humidity/pressure sensor (includes espressif/i2c_bus)
+  espressif/bme280: "^0.1.1"

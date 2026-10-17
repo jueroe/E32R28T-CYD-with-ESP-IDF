@@ -1,0 +1,21 @@
+# Partition table for the E32R28T room thermometer (4 MB flash)
+#
+#   0x000000  bootloader           (written by the bootloader, not part of this file)
+#   0x008000  partition table      (this file)
+#   0x009000  nvs                  24 KB   WiFi calibration, settings, counters
+#   0x00F000  phy_init              4 KB   RF calibration data
+#   0x010000  factory app           3 MB   application
+#   0x300000  storage               1 MB   littlefs: JPEG wallpapers, later logs
+#
+# The littlefs image is created by the joltwallet/littlefs component, which
+# expects the generic "spiffs" data subtype.  It holds the wallpaper directories
+# (spring/summer/autumn/winter x morning/day/evening/night) uploaded over USB.
+#
+# There is no OTA slot on purpose (4 MB is too small for two 3 MB images).
+# Firmware updates are done over USB.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xF000,   0x1000,
+factory,    app,  factory, 0x10000,  0x2F0000,
+storage,    data, spiffs,  0x300000, 0x100000,

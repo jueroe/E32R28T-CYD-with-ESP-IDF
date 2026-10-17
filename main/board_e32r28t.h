@@ -19,6 +19,9 @@
 /* ------------------------------------------------------------------------- */
 /* LCD - ILI9341V, 4-wire SPI (own SPI bus)                                  */
 /* ------------------------------------------------------------------------- */
+/* In ESP-IDF 6 the two free SPI buses are numbered SPI1 and SPI2; the macros
+ * SPI2_HOST / SPI3_HOST still work as deprecated aliases and are used here
+ * (the monitor therefore prints "SPI1" for the LCD and "SPI2" for the touch). */
 #define BOARD_LCD_HOST            SPI2_HOST
 #define BOARD_LCD_PIN_SCLK        GPIO_NUM_14
 #define BOARD_LCD_PIN_MOSI        GPIO_NUM_13
@@ -128,6 +131,23 @@
  * appear without touching, lower it if light touches are ignored.
  */
 #define BOARD_TOUCH_Z_THRESHOLD   250
+
+/* ------------------------------------------------------------------------- */
+/* I2C bus for the BME280                                                    */
+/* ------------------------------------------------------------------------- */
+/* Wired to connector P3 ("SPI peripheral"), because the 4-pin expand connector
+ * only offers IO35, which is input-only and therefore unusable for I2C:
+ *   P3 pin 1 = IO23 -> SDA, P3 pin 4 = IO27 -> SCL.
+ * 3V3 and GND come from the expand connector (P4 pin 1 and 4).
+ * Note: IO18/19/23/27 are the microSD lines, so the SD slot cannot be used
+ * together with this sensor. */
+#define BOARD_I2C_HOST            I2C_NUM_0
+#define BOARD_I2C_PIN_SDA         GPIO_NUM_23
+#define BOARD_I2C_PIN_SCL         GPIO_NUM_27
+#define BOARD_I2C_FREQ_HZ         100000
+
+/* BME280 breakout: I2C mode (CS to 3V3), SDO to GND = address 0x76 */
+#define BOARD_BME280_ADDRESS      0x76
 
 /* ------------------------------------------------------------------------- */
 /* RGB status LED: common anode, one chip per colour, low level = on         */

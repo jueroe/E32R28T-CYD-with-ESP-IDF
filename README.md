@@ -1,7 +1,27 @@
-# E32R28T CYD – erste Tests mit dem Display
+# E32R28T CYD – Raumthermometer, -hygrometer und Luftdruckmesser
 
-ESP-IDF-Projekt für die erste Inbetriebnahme des "Cheap Yellow Display"
+ESP-IDF-Projekt auf Basis des "Cheap Yellow Display"
 (QDtech / LCDWiki **2.8inch ESP32-32E Display**, SKU **E32R28T**).
+
+Ursprünglich als reiner Display-/Touch-Test entstanden; das Display, der Touch,
+die Backlight-Dimmung und die RGB-LED sind inzwischen auf diesem Gerät
+verifiziert. Das Projekt wird zum Raumthermometer ausgebaut.
+
+## Zielbild der Anwendung
+
+| Funktion | Vorgabe |
+|---|---|
+| Sensor | BME280 (Temperatur, relative Luftfeuchte, Luftdruck) über I²C – **läuft** |
+| Uhrzeit | NTP, Anzeigeblock `hh:mm:ss` + Wochentag (Mo./Di. …) + `dd.mm.yy`, sekundengenau |
+| Temperatur | große Ziffern für die ganzen °C, Komma und eine Nachkommastelle, das `°` nur ein Viertel so groß |
+| Luftfeuchte | darunter, etwa halb so große Schrift, Format `xx,x %rF` |
+| Hintergrund | JPEG-Wallpapers nach Jahreszeit (Frühling/Sommer/Herbst/Winter) und Tageszeit (Morgen/Tag/Abend/Nacht), je Slot 3 Bilder zufällig, insgesamt 48 |
+| Schnittstelle | HTTP-Endpunkt, der Temperatur und Luftfeuchte als JSON liefert (später Abruf durch eine Wetterstation) |
+| Ausrichtung | Hochformat, USB-Anschluss unten |
+
+Die Wallpaper liegen am PC unter `backgrounds/<jahreszeit>/<tageszeit>/`, je drei
+JPEG-Dateien pro Ordner (zusammen 715 KB). Sie kommen in die
+littlefs-Partition `storage`, siehe [Flash-Aufteilung](#flash-aufteilung).
 
 ## Hardware
 
@@ -28,6 +48,62 @@ Gerätebeschreibung `cyd-e32r28t` des Tactility-Projekts.
 | BOOT-Taste | 0 |
 | microSD (nicht genutzt) | CS 5, SCK 18, MISO 19, MOSI 23 |
 | Audio (nicht genutzt) | Enable 4 (Low = ein), Ausgang 26 |
+| BME280 (I²C) | **SDA = 23, SCL = 27** (Stecker P3), 3V3/GND von P4 |
+
+### Stecker am Board
+
+| Stecker | Belegung | Nutzung hier |
+|---|---|---|
+| P4 „Expand Pin" (4-polig) | 1 = 3V3, 2 = IO35, 3 = **NC**, 4 = GND | 3V3 + GND für den Sensor |
+| P3 „SPI peripheral" (4-polig) | 1 = IO23, 2 = IO19, 3 = IO18, 4 = IO27, 6 = GND | SDA = IO23, SCL = IO27 |
+
+Aus dem Originalschaltplan (Rev. V1.0): Pin 3 von P4 ist wirklich nicht
+verbunden, könnte also als Durchführung für ein zusätzliches Signal dienen.
+**IO35 (P4 Pin 2) ist aber unbrauchbar für I²C**: GPIO34…39 sind reine
+Eingänge ohne Ausgangstreiber und ohne interne Pull-ups – I²C braucht auf SDA
+und SCL beide Richtungen. Deshalb liegen beide Leitungen auf P3. Nebenwirkung:
+IO18/19/23/27 sind die microSD-Leitungen, der SD-Slot ist damit nicht mehr
+nutzbar.
+
+## Flash-Aufteilung
+
+4 MB Flash, custom Partitionstabelle in [partitions.csv](partitions.csv)
+(`CONFIG_PARTITION_TABLE_CUSTOM=y`):
+
+| Partition | Typ | Offset | Größe | Inhalt |
+|---|---|---|---|---|
+| (bootloader) | – | 0x1000 | 32 KB | vom Bootloader belegt |
+| (Partitionstabelle) | – | 0x8000 | 4 KB | diese Tabelle |
+| `nvs` | data/nvs | 0x9000 | 24 KB | Einstellungen, WLAN-Kalibrierung |
+| `phy_init` | data/phy | 0xF000 | 4 KB | RF-Kalibrierdaten |
+| `factory` | app/factory | 0x10000 | **3008 KB** | Anwendung |
+| `storage` | data/spiffs | 0x300000 | **1 MB** | littlefs: 48 Wallpaper, später Logs |
+
+Bewusste Entscheidungen:
+
+* **3 MB App**: WiFi, NTP, HTTP-Server, LVGL und JPEG-Decoder brauchen deutlich
+  mehr als die 1 MB der Standardtabelle (aktueller Teststand: 192 KB, also 94 %
+  der Partition frei).
+* **1 MB littlefs** ist auf diesem Gerät bereits voll: die 48 vorhandenen
+  Wallpaper belegen 992 KiB inklusive littlefs-Overhead (Details unter
+  [Wallpaper-Ablage](#wallpaper-ablage)). Für mehr Bilder die App-Partition
+  verkleinern (z. B. 2 MB App + 1,94 MB `storage`).
+* **kein OTA-Slot**: Für zwei App-Images à 3 MB ist kein Platz. Updates laufen
+  über USB.
+* Der Subtyp der littlefs-Partition ist `spiffs` (generischer Datentyp) – das
+  erwartet die Komponente `joltwallet/littlefs`. Die Partition wird beim ersten
+  Mount automatisch formatiert (`format_if_mount_failed`).
+
+Prüfen lässt sich die Tabelle ohne Hardware:
+
+```powershell
+.\idf partition-table        # erzeugt build/partition_table/partition-table.bin und zeigt sie an
+```
+
+Nach einer Änderung der Tabelle einmal `.\idf flash` ausführen – die Tabelle
+wird dabei an 0x8000 mitgeschrieben. Ein `erase-flash` ist nicht nötig, solange
+keine Partition ihre Lage ändert; die neue `storage`-Partition liegt in einem
+Bereich, der vorher unbenutzt war.
 
 ## Was das Testprogramm macht
 
@@ -35,11 +111,19 @@ Gerätebeschreibung `cyd-e32r28t` des Tactility-Projekts.
    grün, blau, weiß nacheinander für je 400 ms (steht so im Log), BOOT-Taste als
    Eingang konfigurieren
 2. ILI9341 über SPI2 hochfahren (40 MHz) und in den Querformat-Modus 320×240 bringen
+   (ESP-IDF 6 nennt die beiden freien Busse SPI1/SPI2; die Header verwenden die
+   weiterhin gültigen Aliase `SPI2_HOST`/`SPI3_HOST`, im Monitor erscheint
+   deshalb „SPI1" für das Display und „SPI2" für den Touch)
 3. Testbild aus einem kompletten Framebuffer (150 KB) in Streifen auf das Display schreiben
 4. Backlight auf 100 % dimmen (LEDC-PWM, 20 kHz)
 5. XPT2046 über SPI3 initialisieren; schlägt das fehl, läuft das Programm ohne Touch weiter
-6. Endlosschleife:
+6. littlefs-Partition `storage` einhängen (beim ersten Mal formatieren), Belegung
+   und Dateianzahl loggen
+7. BME280 über I²C einlesen (Adresse 0x76, 16× Oversampling); der Init kehrt
+   erst zurück, wenn eine vollständige Messung vorliegt
+8. Endlosschleife:
    * Statuszeile mit Laufzeit, Frames/s und freiem Heap aktualisieren
+   * alle 2 s eine Messung loggen: `BME280: 23.97 C, 45.8 %rH, 965.5 hPa`
    * grüner Balken wandert alle 5 s einmal über die Breite (Animation/Bandbreite sichtbar)
    * beim Berühren: magenta Punkt an die Tippstelle malen, Roh- und Bildschirmwerte loggen
    * **BOOT** drücken: Testbild neu zeichnen (löscht alle Punkte)
@@ -54,6 +138,79 @@ Gerätebeschreibung `cyd-e32r28t` des Tactility-Projekts.
 | y 124–147 | Verläufe: Schwarz→Weiß, Schwarz→Rot, Schwarz→Blau |
 | y 152–199 | Geometrie: Rahmen, Diagonalen, Kreis, Text „GEOMETRY / 1PX" |
 | y 204–239 | Statuszeile und laufender Balken |
+
+## Wallpaper-Ablage
+
+Die JPEGs liegen im Projektordner [data/](data). Genau dieser Ordner wird beim
+Bauen in ein littlefs-Image gepackt und mit `flash` in die Partition `storage`
+geschrieben. Kopiere deine Verzeichnisstruktur also so hinein:
+
+```
+E32R28T_erste_Tests\
+└─ data\                        <- Inhalt = Wurzel des Dateisystems
+   └─ backgrounds\
+      ├─ spring\  ├─ morning\   1.jpg  2.jpg  3.jpg
+      │           ├─ day\       …
+      │           ├─ evening\   …
+      │           └─ night\     …
+      ├─ summer\  … wie spring
+      ├─ autumn\  … wie spring
+      └─ winter\  … wie spring
+```
+
+Damit ergeben sich auf dem Gerät diese Pfade (Präfix `STORAGE_BASE_PATH` aus
+[storage.h](main/storage.h)):
+
+```
+/littlefs/backgrounds/spring/morning/1.jpg
+/littlefs/backgrounds/summer/day/2.jpg
+…
+```
+
+Also einfach den kompletten Ordner `backgrounds` nach `data\` kopieren:
+
+```powershell
+Copy-Item -Recurse "C:\...\backgrounds" "C:\Users\joe\Documents\ESP-IDF\Projects\E32R28T_erste_Tests\data\"
+```
+
+Dann bauen und flashen – das Image wird automatisch neu erzeugt und ab 0x300000
+geschrieben:
+
+```powershell
+.\idf -p COM8 flash monitor
+```
+
+Erwartete Ausgabe (Ist-Stand mit 48 Dateien):
+
+```
+I (2584) storage: littlefs mounted at /littlefs: 1024 KiB total, 32 KiB free
+I (2634) storage: /littlefs/backgrounds/autumn/day: 3 files, 53200 bytes
+I (2674) storage: /littlefs/backgrounds/autumn/evening: 3 files, 40490 bytes
+…   (16 Ordnerzeilen, je 3 Dateien)
+I (4544) storage: 48 files in total (48 JPEG), 732455 bytes
+```
+
+Hinweise:
+
+* Der Image-Build läuft über `littlefs_create_partition_image(storage ../data
+  FLASH_IN_PROJECT)` in [main/CMakeLists.txt](main/CMakeLists.txt); dabei wird
+  einmalig ein kleines Python-Venv (`build/littlefs_py_venv`) mit
+  `littlefs-python` angelegt.
+* Das Image ist fest 1 MB groß (`--fs-size=0x100000`, Blockgröße 4096).
+* **Platzbedarf (gemessen):** 715 KiB Dateien + 277 KiB littlefs-Overhead =
+  992 KiB belegt, 32 KiB frei. Der Overhead kommt von den Metadatenpaaren
+  (jedes der 21 Verzeichnisse belegt 2 × 4 KiB = 8 KiB, zusammen 168 KiB) und
+  der Blockrundung der Dateien (~109 KiB). Ein viertes Bild pro Slot passt
+  **nicht** mehr hinein – dafür müsste `storage` in
+  [partitions.csv](partitions.csv) vergrößert und die App-Partition entsprechend
+  verkleinert werden (Tabelle danach neu flashen).
+* Dateinamen dürfen bis 127 Zeichen lang sein: `CONFIG_LITTLEFS_OBJ_NAME_LEN=128`
+  in [sdkconfig.defaults](sdkconfig.defaults), weil der längste vorhandene Name
+  73 Zeichen hat (Vorgabe der Komponente ist 64). Der Image-Build übernimmt den
+  Wert automatisch als `--name-max`.
+* Jedes `flash` schreibt die komplette Partition neu (ca. 6 s), auch wenn sich
+  nur die App geändert hat. Wer das nicht will, flasht die App gezielt mit
+  `.\idf app-flash` (Tabelle und Image bleiben dann unangetastet).
 
 ## Voraussetzungen
 
@@ -101,26 +258,61 @@ statt des C/C++-Parsers lieber clangd nutzt, installiert die Extension
 `"C_Cpp.intelliSenseEngine": "disabled"`, damit sich beide nicht in die Quere
 kommen.
 
-### Auf der Kommandozeile (PowerShell)
+### Auf der Kommandozeile
+
+`idf.py` liegt bei einer EIM-Installation **nicht** im PATH; es funktioniert nur
+in einer Shell, in der das Aktivierungsskript geladen wurde. Dafür gibt es drei
+Wege:
+
+**1. Wrapper im Projekt (empfohlen, funktioniert in jedem Fenster)**
 
 ```powershell
-# ESP-IDF-Umgebung aktivieren (dieselbe Umgebung, die auch VS Code nutzt)
-. C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1
-
 cd C:\Users\joe\Documents\ESP-IDF\Projects\E32R28T_erste_Tests
-idf.py build
-idf.py -p COM3 flash monitor     # COMx = Port des Boards
+.\idf build
+.\idf -p COM8 flash monitor     # COMx = Port des Boards
 # Monitor beenden: Strg + ]
 ```
+
+[idf.cmd](idf.cmd) setzt `IDF_PATH`, `IDF_TOOLS_PATH`, `IDF_PYTHON_ENV_PATH`
+und den Toolchain-Pfad für diesen Aufruf und reicht alle Argumente an `idf.py`
+weiter. Eine `.cmd`-Datei ist von der PowerShell-ExecutionPolicy nicht
+betroffen, deshalb funktioniert das auch bei `Restricted` (Standard auf diesem
+Rechner). Nach einem Wechsel der ESP-IDF-Version über den EIM müssen die Pfade
+oben in der Datei angepasst werden.
+
+**2. ESP-IDF-Umgebung in der aktuellen Sitzung aktivieren**
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned   # einmalig
+. C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1
+idf.py build
+```
+
+Ohne die Policy-Änderung bricht das Laden des Profils mit
+„Die Ausführung von Skripts ist auf diesem System deaktiviert" ab. Danach ist
+`idf.py` als Alias verfügbar – allerdings nur in diesem Fenster.
+
+**3. Nur für einen Aufruf, ohne Policy-Änderung**
+
+```powershell
+powershell -ExecutionPolicy Bypass -NoExit -Command ". 'C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1'"
+```
+
+Öffnet ein neues Fenster mit vollständiger ESP-IDF-Umgebung.
 
 Der erste Build lädt die verwalteten Komponenten automatisch aus der ESP
 Component Registry nach `managed_components/`:
 
 * `espressif/esp_lcd_ili9341` 2.1.0 (ILI9341-Treiber für `esp_lcd`)
 * `atanisoft/esp_lcd_touch_xpt2046` 1.0.6 + `espressif/esp_lcd_touch` 1.2.1
+* `joltwallet/littlefs` 1.23.0 (Dateisystem der Wallpaper-Partition)
+* `espressif/bme280` 0.1.1 + `espressif/i2c_bus` 1.5.2 (Sensor am I²C-Bus; die
+  i2c_bus-Version nutzt ab ESP-IDF 5.3 den neuen `i2c_master`-Treiber, der alte
+  `driver/i2c.h` existiert in IDF 6 nicht mehr)
 
-Zum Testen ohne Hardware genügt `idf.py build` – es ist bereits erfolgreich
-durchgelaufen (App-Binärdatei ca. 191 KB, Flash 4 MB, CPU 240 MHz).
+Zum Testen ohne Hardware genügt `.\idf build` – es ist bereits erfolgreich
+durchgelaufen (App-Binärdatei 192 KB in einer 3008-KB-Partition, Flash 4 MB,
+CPU 240 MHz).
 
 ## Projektstruktur
 
@@ -131,9 +323,14 @@ durchgelaufen (App-Binärdatei ca. 191 KB, Flash 4 MB, CPU 240 MHz).
 | [main/gfx.c](main/gfx.c), [main/gfx.h](main/gfx.h) | Mini-Grafikbibliothek: Canvas, Rechtecke, Linien, Kreis, Text, Flush |
 | [main/font5x7.c](main/font5x7.c), [main/font5x7.h](main/font5x7.h) | 5×7-Pixel-Font (A–Z, 0–9, Satzzeichen), generiert |
 | [main/touch.c](main/touch.c), [main/touch.h](main/touch.h) | XPT2046: SPI-Bus, `esp_lcd_touch`, Rohwert → Bildschirmkoordinate |
+| [main/storage.c](main/storage.c), [main/storage.h](main/storage.h) | littlefs: Mount der `storage`-Partition, Belegung, Dateizählung |
+| [main/sensor.c](main/sensor.c), [main/sensor.h](main/sensor.h) | BME280: I²C-Bus, Sensor-Init, Temperatur/Feuchte/Druck |
+| [data/](data) | Inhalt der littlefs-Partition (Wallpaper), wird beim Bauen zum Image |
 | [main/idf_component.yml](main/idf_component.yml) | Abhängigkeiten aus der Component Registry |
 | [tools/gen_font5x7.py](tools/gen_font5x7.py) | Erzeugt den Font neu (Glyphen als ASCII-Art, mit Probedruck) |
-| [sdkconfig.defaults](sdkconfig.defaults) | 4 MB Flash, 240 MHz CPU, Ziel esp32, Z-Druckschwelle des Touch-Treibers |
+| [sdkconfig.defaults](sdkconfig.defaults) | 4 MB Flash, 240 MHz CPU, Ziel esp32, eigene Partitionstabelle, littlefs-Namenslänge 128, Z-Druckschwelle des Touch-Treibers |
+| [partitions.csv](partitions.csv) | Partitionstabelle: nvs, phy_init, 3 MB App, 1 MB littlefs |
+| [idf.cmd](idf.cmd) | Wrapper: `.\idf build` / `.\idf -p COM8 flash monitor` ohne ESP-IDF-Profil |
 
 ## Erwartete Ausgabe auf dem seriellen Monitor
 
@@ -150,8 +347,15 @@ I (xxx) cyd: ILI9341 ready, 320x240 landscape, 40 MHz SPI clock, BGR element ord
 I (xxx) gfx: canvas 320x240: framebuffer 153600 bytes, bounce buffer 15360 bytes
 I (xxx) cyd: test pattern drawn, backlight on - press BOOT (GPIO0) to redraw
 I (xxx) touch: SPI3 for XPT2046: SCK=25 MOSI=32 MISO=39 CS=33
-I (xxx) touch: XPT2046 ready, raw axes 200..3900 / 200..3900, swap=0 mirror=0/0
-I (xxx) cyd: 124000 free heap bytes after initialisation
+I (2464) touch: XPT2046 ready, raw axes 300..3805 / 215..3712, swap=1 mirror=1/1
+I (2474) storage: littlefs mounted at /littlefs: 1024 KiB total, 1008 KiB free
+I (4464) storage: 0 files in total (0 JPEG), 0 bytes
+I (4464) sensor: I2C0 for BME280: SDA=23 SCL=27, 100 kHz, address 0x76
+I (4464) i2c_bus: I2C Bus V2 uses the externally initialized bus handle
+I (4864) sensor: BME280 ready, first reading: 23.88 C, 45.8 %rH, 965.5 hPa
+I (4864) cyd: 123624 free heap bytes after initialisation
+I (4864) cyd: BME280: 23.88 C, 45.8 %rH, 965.5 hPa
+I (6874) cyd: BME280: 23.97 C, 45.8 %rH, 965.4 hPa
 I (xxx) cyd: TOUCH: RAW 1234/2345 -> 120/160  Z 900     (beim Berühren, max. 5/s)
 ```
 
@@ -161,6 +365,15 @@ I (xxx) cyd: TOUCH: RAW 1234/2345 -> 120/160  Z 900     (beim Berühren, max. 5/
 |---|---|
 | Kein Log auf dem Monitor | Falscher COM-Port, USB-Kabel ohne Datenleitungen, BOOT gedrückt halten und EN/RESET tippen |
 | „cannot open source file stdio.h" (IntelliSense) | `.vscode/c_cpp_properties.json` prüfen: `compilerPath` muss auf die vorhandene `xtensa-esp32-elf-gcc.exe` zeigen und `compileCommands` auf die gebaute `build/compile_commands.json` (erst nach einem Build vorhanden). Danach „C/C++: Reset IntelliSense Database" |
+| `idf.py` wird nicht erkannt (`CommandNotFoundException`) | `idf.py` liegt bei EIM-Installationen nicht im PATH. Entweder `.\idf build` (Wrapper im Projekt) oder die ESP-IDF-Umgebung laden, siehe [Auf der Kommandozeile](#auf-der-kommandozeile) |
+| „Die Ausführung von Skripts ist auf diesem System deaktiviert" | PowerShell-ExecutionPolicy ist `Restricted` (Windows-Standard). Entweder den Wrapper `.\idf` nutzen oder einmalig `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` ausführen |
+| `partition 'storage' not found` / littlefs meldet `ESP_ERR_NOT_FOUND` | Partitionstabelle im Flash ist noch die alte: `.\idf -p COM8 flash` (schreibt sie an 0x8000 mit). Prüfen mit `.\idf partition-table` |
+| `storage: 0 files in total` obwohl Wallpaper vorhanden | Dateien liegen nicht unter `data/` (z. B. eine Ebene zu tief, etwa `data/backgrounds/backgrounds/…`). Prüfen mit `python -m littlefs list build\storage.bin --block-size 4096` im Ordner `build\littlefs_py_venv\Scripts\` |
+| littlefs-Image zu groß für die Partition | Weniger/kleinere JPEGs, oder `storage` in [partitions.csv](partitions.csv) vergrößern (App-Partition entsprechend verkleinern) und Tabelle neu flashen |
+| Dateiname wird nicht angelegt / `LFS_ERR_NAMETOOLONG` | Name länger als `CONFIG_LITTLEFS_OBJ_NAME_LEN - 1` (aktuell 127 Zeichen), oder das Image wurde vor der Änderung gebaut: `.\idf fullclean` und neu bauen |
+| BME280 meldet `no BME280 at 0x76` | SDA/SCL vertauscht oder nicht kontaktiert (SDA = IO23/P3-Pin1, SCL = IO27/P3-Pin4), 3V3/GND fehlen, oder die Adressbrücke ist nicht auf 0x76 (SDO an GND). Pull-ups: Breakout hat 10 kΩ, sonst 4,7 kΩ nach 3V3 ergänzen |
+| BME280 liefert unsinnige Werte | Sensor kurz vorher verlötet/angefasst – Selbstaufheizung; 1–2 Minuten warten. Druck wird in hPa ausgegeben (965,5 hPa entspricht ca. 400 m Höhe) |
+| `Could not open COM8, the port is busy` beim Flashen | Ein noch laufender Monitor hält den Port: im Monitor `Strg+]`, sonst das Fenster schließen, dann erneut flashen |
 | Bildschirm bleibt dunkel, Log endet mit `cyd: LCD bring-up failed` | Fehlerzeile darüber lesen (SPI/Registrierung). Backlight an GPIO21 prüfen – manche Board-Revisionen nutzen GPIO27 (`BOARD_LCD_PIN_BACKLIGHT`) |
 | Bild ist da, aber wie ein Negativ | `BOARD_LCD_INVERT_COLORS` auf `1` setzen |
 | Rot und Blau vertauscht | `BOARD_LCD_BGR` auf `0` setzen |
@@ -232,8 +445,17 @@ Abhängigkeiten selbst nach. `sdkconfig.defaults` wirkt nur bei neu erzeugter
 
 ## Nächste Schritte
 
-* LVGL 9 über `espressif/esp_lvgl_port` einbinden (der Canvas in `gfx.c` kann
-  dann durch einen LVGL-Zeichenpuffer ersetzt werden)
-* microSD-Karte über SPI3 (CS=5) anbinden – Achtung: derselbe Bus wie der Touch
-* Lautsprecher (GPIO26) mit I2S oder LEDC-PWM ansteuern, Verstärker über GPIO4 freigeben
-* WLAN/BLE: dafür `CONFIG_BT_ENABLED`/WLAN zuschalten und Heap-Verbrauch beachten
+1. ~~Partitionierung~~ – erledigt, siehe [Flash-Aufteilung](#flash-aufteilung)
+2. ~~littlefs + Wallpaper~~ – erledigt, siehe [Wallpaper-Ablage](#wallpaper-ablage)
+3. ~~BME280~~ – erledigt: SDA = IO23, SCL = IO27, Adresse 0x76
+4. NTP-Zeit über WLAN holen (`esp_sntp`), Zeitzone Europe/Berlin
+5. Anzeige im Hochformat: große Temperaturziffern, kleines `°`, Feuchte darunter,
+   Zeile mit Uhrzeit/Datum, Wallpaper im Hintergrund
+6. HTTP-Server mit JSON-Endpunkt für Temperatur/Luftfeuchte
+7. Bildauswahl: Jahreszeit aus dem Datum, Tageszeit aus der Uhrzeit, Zufall aus
+   den drei JPEGs pro Slot, JPEG-Decoder (z. B. `espressif/esp_jpeg`)
+
+Optional, nicht für das Raumthermometer nötig:
+
+* microSD-Karte über SPI3 (CS=5) – Achtung: derselbe Bus wie der Touch
+* Lautsprecher (GPIO26) mit I2S oder LEDC-PWM, Verstärker über GPIO4

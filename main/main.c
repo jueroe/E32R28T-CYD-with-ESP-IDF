@@ -36,6 +36,8 @@
 
 #include "board_e32r28t.h"
 #include "gfx.h"
+#include "sensor.h"
+#include "storage.h"
 #include "touch.h"
 
 static const char *TAG = "cyd";
@@ -341,11 +343,23 @@ void app_main(void)
     if (touch_init() != ESP_OK) {
         ESP_LOGW(TAG, "touch not available, continuing without the touch test");
     }
+
+    if (storage_init() == ESP_OK) {
+        storage_log_summary();
+    } else {
+        ESP_LOGW(TAG, "wallpaper partition not available");
+    }
+
+    if (sensor_init() != ESP_OK) {
+        ESP_LOGW(TAG, "BME280 not available, continuing without sensor values");
+    }
+
     ESP_LOGI(TAG, "%d free heap bytes after initialisation", (int)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
 
     const int64_t start_us = esp_timer_get_time();
     int64_t last_report_us = start_us;
     int64_t last_touch_log_us = 0;
+    int64_t last_sensor_read_us = 0;
     int frames = 0;
     int fps = 0;
     char touch_line[48];
@@ -368,6 +382,19 @@ void app_main(void)
             if (now_us - last_touch_log_us > 200000) {
                 last_touch_log_us = now_us;
                 ESP_LOGI(TAG, "%s", touch_line);
+            }
+        }
+
+        /* BME280: log a reading every 2 s (the display layout follows later) */
+        if (sensor_is_available() && now_us - last_sensor_read_us >= 2000000) {
+            last_sensor_read_us = now_us;
+            sensor_reading_t reading;
+            const esp_err_t err = sensor_read(&reading);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "BME280: %.2f C, %.1f %%rH, %.1f hPa", reading.temperature_c,
+                         reading.humidity_rh, reading.pressure_hpa);
+            } else {
+                ESP_LOGW(TAG, "BME280 read failed: %s", esp_err_to_name(err));
             }
         }
 
