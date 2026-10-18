@@ -14,3 +14,6 @@ dependencies:
 
   ## BME280 temperature/humidity/pressure sensor (includes espressif/i2c_bus)
   espressif/bme280: "^0.1.1"
+
+  ## JPEG decoder for the wallpaper images
+  espressif/esp_jpeg: "^1.3.1"

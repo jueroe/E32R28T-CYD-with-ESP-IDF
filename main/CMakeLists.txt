@@ -1,10 +1,19 @@
-idf_component_register(SRCS "main.c"
+idf_component_register(SRCS
+                            "main.c"
                             "gfx.c"
                             "font5x7.c"
                             "touch.c"
                             "storage.c"
                             "sensor.c"
+                            "statusled.c"
+                            "testscreen.c"
+                            "bigdigit.c"
+                            "ttf.c"
+                            "wallpaper.c"
                        INCLUDE_DIRS "."
+                       # Open Sans Regular is linked into the application image
+                       # (rodata) and read directly from flash at runtime.
+                       EMBED_FILES "fonts/OpenSans-Regular.ttf"
                        # The project is built with MINIMAL_BUILD, so every
                        # component used here has to be listed explicitly.
                        REQUIRES esp_lcd
@@ -17,7 +26,8 @@ idf_component_register(SRCS "main.c"
                                 atanisoft__esp_lcd_touch_xpt2046
                                 joltwallet__littlefs
                                 espressif__bme280
-                                espressif__i2c_bus)
+                                espressif__i2c_bus
+                                espressif__esp_jpeg)
 
 # Build the littlefs image for the "storage" partition from data/ and write it
 # together with `idf.py flash`.  Everything below data/ keeps its relative path:

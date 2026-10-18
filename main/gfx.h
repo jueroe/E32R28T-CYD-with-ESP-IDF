@@ -14,23 +14,7 @@
 #include "esp_err.h"
 #include "esp_lcd_panel_ops.h"
 
-#define GFX_SWAP16(value)   ((uint16_t)((((uint16_t)(value) << 8) | ((uint16_t)(value) >> 8))))
-#define GFX_RGB565(r, g, b) GFX_SWAP16((uint16_t)((((uint16_t)(r) & 0xF8) << 8) | \
-                                                 (((uint16_t)(g) & 0xFC) << 3) | \
-                                                 ((uint16_t)(b) >> 3)))
-
-#define GFX_BLACK       GFX_RGB565(0x00, 0x00, 0x00)
-#define GFX_WHITE       GFX_RGB565(0xFF, 0xFF, 0xFF)
-#define GFX_RED         GFX_RGB565(0xFF, 0x00, 0x00)
-#define GFX_GREEN       GFX_RGB565(0x00, 0xFF, 0x00)
-#define GFX_BLUE        GFX_RGB565(0x00, 0x00, 0xFF)
-#define GFX_CYAN        GFX_RGB565(0x00, 0xFF, 0xFF)
-#define GFX_MAGENTA     GFX_RGB565(0xFF, 0x00, 0xFF)
-#define GFX_YELLOW      GFX_RGB565(0xFF, 0xFF, 0x00)
-#define GFX_ORANGE      GFX_RGB565(0xFF, 0x80, 0x00)
-#define GFX_GRAY        GFX_RGB565(0x80, 0x80, 0x80)
-#define GFX_DARK_GRAY   GFX_RGB565(0x30, 0x30, 0x30)
-#define GFX_NAVY        GFX_RGB565(0x00, 0x20, 0x60)
+#include "gfx_color.h"
 
 /* Number of pixel lines sent to the panel per transfer */
 #define GFX_FLUSH_BAND_LINES 24
@@ -61,6 +45,15 @@ void gfx_gradient_h(gfx_canvas_t *canvas, int x, int y, int width, int height,
 
 /** Width in pixels that gfx_text() needs for `text`. */
 int gfx_text_width(const char *text, int scale);
+
+/**
+ * Blend an 8 bit alpha mask onto the canvas.
+ *
+ * @param mask    one byte per pixel, 0 = transparent, 255 = fully `color`
+ * @param stride  bytes per mask row (usually the width)
+ */
+void gfx_blend_mask(gfx_canvas_t *canvas, int x, int y, int width, int height,
+                    const uint8_t *mask, int stride, uint16_t color);
 
 /**
  * Draw `text` (upper case only font, lower case input is folded) at x/y.

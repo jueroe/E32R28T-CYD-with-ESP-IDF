@@ -174,6 +174,67 @@ int gfx_text_width(const char *text, int scale)
     return (length * FONT5X7_ADVANCE - 1) * (scale < 1 ? 1 : scale);
 }
 
+/* Split a byte-swapped RGB565 value into 5/6/5 components. */
+static inline void rgb565_unpack(uint16_t value, int *r, int *g, int *b)
+{
+    const uint16_t native = GFX_SWAP16(value);
+    *r = (native >> 11) & 0x1F;
+    *g = (native >> 5) & 0x3F;
+    *b = native & 0x1F;
+}
+
+static inline uint16_t rgb565_pack(int r, int g, int b)
+{
+    return GFX_SWAP16((uint16_t)((r << 11) | (g << 5) | b));
+}
+
+void gfx_blend_mask(gfx_canvas_t *canvas, int x, int y, int width, int height,
+                    const uint8_t *mask, int stride, uint16_t color)
+{
+    if (mask == NULL || width <= 0 || height <= 0) {
+        return;
+    }
+
+    int cr = 0;
+    int cg = 0;
+    int cb = 0;
+    rgb565_unpack(color, &cr, &cg, &cb);
+
+    for (int row = 0; row < height; row++) {
+        const int dest_y = y + row;
+        if (dest_y < 0 || dest_y >= canvas->height) {
+            continue;
+        }
+        const uint8_t *mask_row = mask + row * stride;
+        uint16_t *dest_row = &canvas->pixels[dest_y * canvas->width];
+
+        for (int column = 0; column < width; column++) {
+            const int alpha = mask_row[column];
+            if (alpha == 0) {
+                continue;
+            }
+            const int dest_x = x + column;
+            if (dest_x < 0 || dest_x >= canvas->width) {
+                continue;
+            }
+            if (alpha == 255) {
+                dest_row[dest_x] = color;
+                continue;
+            }
+
+            int r = 0;
+            int g = 0;
+            int b = 0;
+            rgb565_unpack(dest_row[dest_x], &r, &g, &b);
+            /* 5/6/5 weights: scale the foreground by alpha and add the rest */
+            r += (cr - r) * alpha / 255;
+            g += (cg - g) * alpha / 255;
+            b += (cb - b) * alpha / 255;
+            dest_row[dest_x] = rgb565_pack(r, g, b);
+        }
+    }
+}
+
 void gfx_text(gfx_canvas_t *canvas, int x, int y, const char *text, uint16_t color,
               uint16_t background, int scale, bool opaque)
 {

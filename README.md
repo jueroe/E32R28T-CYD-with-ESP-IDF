@@ -17,11 +17,68 @@ verifiziert. Das Projekt wird zum Raumthermometer ausgebaut.
 | Luftfeuchte | darunter, etwa halb so große Schrift, Format `xx,x %rF` |
 | Hintergrund | JPEG-Wallpapers nach Jahreszeit (Frühling/Sommer/Herbst/Winter) und Tageszeit (Morgen/Tag/Abend/Nacht), je Slot 3 Bilder zufällig, insgesamt 48 |
 | Schnittstelle | HTTP-Endpunkt, der Temperatur und Luftfeuchte als JSON liefert (später Abruf durch eine Wetterstation) |
-| Ausrichtung | Hochformat, USB-Anschluss unten |
+| Ausrichtung | **Hochformat 240×320**, von der ursprünglichen Querformat-Ansicht um 90° nach rechts gedreht: (0,0) oben links, x bis 239 nach rechts, y bis 319 nach unten |
 
 Die Wallpaper liegen am PC unter `backgrounds/<jahreszeit>/<tageszeit>/`, je drei
-JPEG-Dateien pro Ordner (zusammen 715 KB). Sie kommen in die
+JPEG-Dateien pro Ordner (zusammen 712 KB). Sie kommen in die
 littlefs-Partition `storage`, siehe [Flash-Aufteilung](#flash-aufteilung).
+
+## Anzeige-Layout (Hochformat)
+
+Die Bilder enthalten bereits zwei Glasflächen (Glassmorph-Effekt) für die
+Texte; die Anwendung zeichnet nur noch die Werte hinein.
+
+| Element | Bereich | Umsetzung |
+|---|---|---|
+| Temperatur | frei positionierbar (aktuell x 25, Grundlinie y 175, `°`-Ecke 215/25) | `xx,x` mit 120 px hohen Ziffern, Komma und Nachkommastelle halb so groß und unten bündig, `°` separat platziert – [bigdigit.c](main/bigdigit.c), Werte in [layout.h](main/layout.h) |
+| Luftfeuchte | folgt | geplant |
+| Uhrzeit/Datum | folgt | geplant |
+
+Die Temperatur wird mit der eingebetteten **TrueType-Schrift Open Sans** gezeichnet
+([ttf.c](main/ttf.c), Renderer `stb_truetype`, Font liegt als `EMBED_FILES` im
+Flash und wird ohne RAM-Kopie gelesen). Vorteil gegenüber den Bitmap-Fonts: jede
+Größe, saubere Kantenglättung, echte Schriftformen – und derselbe Renderer deckt
+später auch Uhrzeit, Datum und Luftfeuchte ab.
+
+### Layout einstellen – [main/layout.h](main/layout.h)
+
+Alle Werte der Anzeige stehen in einer Datei, geändert wird nur dort. Die
+Koordinaten gelten im Hochformat: (0,0) oben links, x bis 239 nach rechts, y bis
+319 nach unten.
+
+| Makro | Bedeutung | aktuell |
+|---|---|---|
+| `LAYOUT_TEMP_X` | linke Kante der ersten großen Ziffer | 25 |
+| `LAYOUT_TEMP_BASELINE_Y` | Grundlinie = Unterkante der großen Ziffern; Komma-Schweif und Nachkommastelle enden hier ebenfalls | 175 |
+| `LAYOUT_TEMP_MAX_WIDTH` | Breite, auf die die Zeichengruppe höchstens gestaucht wird | 190 |
+| `LAYOUT_TEMP_DIGIT_HEIGHT` | Höhe der beiden Ziffern vor dem Komma | 120 |
+| `LAYOUT_TEMP_MIN_SQUEEZE` | stärkste horizontale Stauchung; `1.0` = nie stauchen, `0.5` = sehr schmal | 0.55 |
+| `LAYOUT_TEMP_DECIMAL_SCALE` | Komma + Nachkommastelle relativ zur Ziffernhöhe | 0.5 |
+| `LAYOUT_TEMP_DEGREE_X` | rechte Kante des `°` | 215 |
+| `LAYOUT_TEMP_DEGREE_Y` | Oberkante des `°` | 25 |
+| `LAYOUT_TEMP_DEGREE_SCALE` | `°` relativ zur Ziffernhöhe | 0.5 |
+
+Die Positionen von Ziffernblock und Gradzeichen sind damit unabhängig: `x` und
+Grundlinie gehören zum Zahlentext, `DEGREE_X/Y` bezeichnen die **obere rechte
+Ecke der Tinte** des Gradzeichens. Beides lässt sich frei auf dem Bildschirm
+platzieren, auch überlappend.
+
+Ablauf zum Ausprobieren: Wert ändern → `.\idf build` → `.\idf -p COM8 app-flash`
+→ im Monitor die Zeilen ansehen:
+
+```
+bigdigit: "21,8" cap 120 px, scale x/y 0.060/0.082, from x=25 on baseline y=175, 187 px wide
+bigdigit: degree: 27x25 px ink, top right corner at (215,25)
+```
+
+Regeln, die der Renderer anwendet:
+
+* Die Ziffern-Gruppe wird horizontal gestaucht, bis sie in `MAX_WIDTH` passt –
+  aber höchstens bis `MIN_SQUEEZE`. Ist selbst das zu wenig, verringert der
+  Renderer die Ziffernhöhe, damit die Proportionen lesbar bleiben.
+* Komma und Nachkommastelle sitzen mit ihrer Unterkante auf der Grundlinie; der
+  Komma-Schweif endet ebenfalls dort.
+* Das Gradzeichen wird an `DEGREE_X/Y` ausgerichtet, egal wie groß es ist.
 
 ## Hardware
 
@@ -105,39 +162,41 @@ wird dabei an 0x8000 mitgeschrieben. Ein `erase-flash` ist nicht nötig, solange
 keine Partition ihre Lage ändert; die neue `storage`-Partition liegt in einem
 Bereich, der vorher unbenutzt war.
 
-## Was das Testprogramm macht
+## Was das Programm macht
 
 1. Backlight aus, RGB-LED initialisieren, danach **Selbsttest der LED**: rot,
-   grün, blau, weiß nacheinander für je 400 ms (steht so im Log), BOOT-Taste als
-   Eingang konfigurieren
-2. ILI9341 über SPI2 hochfahren (40 MHz) und in den Querformat-Modus 320×240 bringen
+   grün, blau, weiß nacheinander für je 400 ms (steht so im Log)
+2. ILI9341 über SPI2 hochfahren (40 MHz) in den **Hochformat-Modus 240×320**
    (ESP-IDF 6 nennt die beiden freien Busse SPI1/SPI2; die Header verwenden die
    weiterhin gültigen Aliase `SPI2_HOST`/`SPI3_HOST`, im Monitor erscheint
    deshalb „SPI1" für das Display und „SPI2" für den Touch)
-3. Testbild aus einem kompletten Framebuffer (150 KB) in Streifen auf das Display schreiben
-4. Backlight auf 100 % dimmen (LEDC-PWM, 20 kHz)
-5. XPT2046 über SPI3 initialisieren; schlägt das fehl, läuft das Programm ohne Touch weiter
-6. littlefs-Partition `storage` einhängen (beim ersten Mal formatieren), Belegung
+3. Canvas 240×320 anlegen (Framebuffer 150 KB, DMA-fähig)
+4. littlefs-Partition `storage` einhängen (beim ersten Mal formatieren), Belegung
    und Dateianzahl loggen
-7. BME280 über I²C einlesen (Adresse 0x76, 16× Oversampling); der Init kehrt
-   erst zurück, wenn eine vollständige Messung vorliegt
-8. Endlosschleife:
-   * Statuszeile mit Laufzeit, Frames/s und freiem Heap aktualisieren
-   * alle 2 s eine Messung loggen: `BME280: 23.97 C, 45.8 %rH, 965.5 hPa`
-   * grüner Balken wandert alle 5 s einmal über die Breite (Animation/Bandbreite sichtbar)
-   * beim Berühren: magenta Punkt an die Tippstelle malen, Roh- und Bildschirmwerte loggen
-   * **BOOT** drücken: Testbild neu zeichnen (löscht alle Punkte)
-   * LED: grün = Programm läuft, blau = solange neu gezeichnet wird
+5. BME280 über I²C initialisieren (Adresse 0x76, 16× Oversampling); der Init
+   kehrt erst zurück, wenn eine vollständige Messung vorliegt
+6. XPT2046 initialisieren
+7. Backlight auf 100 %, LED grün
+8. **Thermometer-Schleife**: Wallpaper dekodieren (JPEG → RGB565 direkt in den
+   Canvas), Temperatur als `xx,x°` in die Kachel zeichnen, Frame senden. Alle
+   10 s eine neue Messung; neu gezeichnet wird nur, wenn sich die Anzeige
+   (Zehntelgrad) ändert.
 
-### Bildschirmaufbau (320×240 Querformat)
+Das alte Hardware-Testbild liegt getrennt in
+[testscreen.c](main/testscreen.c)/[testscreen.h](main/testscreen.h) (Muster,
+Statuszeile, Touch-Punkte, BOOT-Neudruck). Einschalten mit
+`APP_SHOW_TESTSCREEN 1` in [main.c](main/main.c); zum Entfernen beide Dateien
+und den einen Aufruf löschen.
+
+### Bildschirmaufbau des Testbilds (Hochformat 240×320)
 
 | Bereich | Inhalt |
 |---|---|
-| y 0–19 | Titelbalken: Boardname, ESP-IDF-Version |
-| y 24–119 | Farbreihen: Weiß, Gelb, Cyan, Grün, Magenta, Rot, Blau, Schwarz |
-| y 124–147 | Verläufe: Schwarz→Weiß, Schwarz→Rot, Schwarz→Blau |
-| y 152–199 | Geometrie: Rahmen, Diagonalen, Kreis, Text „GEOMETRY / 1PX" |
-| y 204–239 | Statuszeile und laufender Balken |
+| y 0–25 | Titelbalken: Boardname, ESP-IDF-Version |
+| y 32–151 | Farbreihen: Weiß, Gelb, Cyan, Grün, Magenta, Rot, Blau, Schwarz |
+| y 158–187 | Verläufe: Schwarz→Weiß, Schwarz→Rot, Schwarz→Blau |
+| y 194–257 | Geometrie: Rahmen, Diagonalen, Kreis, Text „GEOMETRY 1PX" |
+| y 264–319 | Statuszeile und laufender Balken |
 
 ## Wallpaper-Ablage
 
@@ -183,11 +242,11 @@ geschrieben:
 Erwartete Ausgabe (Ist-Stand mit 48 Dateien):
 
 ```
-I (2584) storage: littlefs mounted at /littlefs: 1024 KiB total, 32 KiB free
-I (2634) storage: /littlefs/backgrounds/autumn/day: 3 files, 53200 bytes
+I (2594) storage: littlefs mounted at /littlefs: 1024 KiB total, 36 KiB free
+I (2644) storage: /littlefs/backgrounds/autumn/day: 3 files, 53200 bytes
 I (2674) storage: /littlefs/backgrounds/autumn/evening: 3 files, 40490 bytes
 …   (16 Ordnerzeilen, je 3 Dateien)
-I (4544) storage: 48 files in total (48 JPEG), 732455 bytes
+I (4444) storage: 48 files in total (48 JPEG), 728964 bytes
 ```
 
 Hinweise:
@@ -197,17 +256,17 @@ Hinweise:
   einmalig ein kleines Python-Venv (`build/littlefs_py_venv`) mit
   `littlefs-python` angelegt.
 * Das Image ist fest 1 MB groß (`--fs-size=0x100000`, Blockgröße 4096).
-* **Platzbedarf (gemessen):** 715 KiB Dateien + 277 KiB littlefs-Overhead =
-  992 KiB belegt, 32 KiB frei. Der Overhead kommt von den Metadatenpaaren
+* **Platzbedarf (gemessen):** 712 KiB Dateien + 276 KiB littlefs-Overhead =
+  988 KiB belegt, 36 KiB frei. Der Overhead kommt von den Metadatenpaaren
   (jedes der 21 Verzeichnisse belegt 2 × 4 KiB = 8 KiB, zusammen 168 KiB) und
-  der Blockrundung der Dateien (~109 KiB). Ein viertes Bild pro Slot passt
+  der Blockrundung der Dateien (~108 KiB). Ein viertes Bild pro Slot passt
   **nicht** mehr hinein – dafür müsste `storage` in
   [partitions.csv](partitions.csv) vergrößert und die App-Partition entsprechend
   verkleinert werden (Tabelle danach neu flashen).
 * Dateinamen dürfen bis 127 Zeichen lang sein: `CONFIG_LITTLEFS_OBJ_NAME_LEN=128`
-  in [sdkconfig.defaults](sdkconfig.defaults), weil der längste vorhandene Name
-  73 Zeichen hat (Vorgabe der Komponente ist 64). Der Image-Build übernimmt den
-  Wert automatisch als `--name-max`.
+  in [sdkconfig.defaults](sdkconfig.defaults) (Vorgabe der Komponente ist 64).
+  Der längste Name ist inzwischen auf 29 Zeichen gekürzt, der Wert bleibt aber
+  großzügig – der Image-Build übernimmt ihn automatisch als `--name-max`.
 * Jedes `flash` schreibt die komplette Partition neu (ca. 6 s), auch wenn sich
   nur die App geändert hat. Wer das nicht will, flasht die App gezielt mit
   `.\idf app-flash` (Tabelle und Image bleiben dann unangetastet).
@@ -250,6 +309,15 @@ Wenn die Meldungen nach einem Toolchain-Update wieder auftauchen, zeigt
 `.vscode/c_cpp_properties.json` den aktuellen Pfad eintragen (Ordner
 `C:\Espressif\tools\xtensa-esp-elf\`) und in VS Code
 „C/C++: Reset IntelliSense Database" ausführen.
+
+**Header, die in keinem `.c` eingebunden sind** (`background.h` ist so ein Fall),
+stehen nicht in der Compile-Datenbank. IntelliSense prüft sie dann nur mit dem
+Projekt-Suchpfad `${workspaceFolder}/**`, nicht mit den ESP-IDF-Pfaden. Sobald
+so ein Header einen anderen Header aus dem Projekt einbindet, der seinerseits
+ESP-IDF-Header braucht (früher `gfx.h` → `esp_lcd_panel_ops.h`), meldet VS Code
+einen Include-Fehler, obwohl der Compiler die Datei akzeptiert. Lösung: die
+Abhängigkeit klein halten – reine Daten-/Farbtabellen binden nur
+[gfx_color.h](main/gfx_color.h) ein, das außer `<stdint.h>` nichts braucht.
 
 Alternative: die ESP-IDF-Erweiterung hat in `.vscode/settings.json` schon
 Einstellungen für `clangd` hinterlegt (inklusive `--compile-commands-dir`). Wer
@@ -309,22 +377,33 @@ Component Registry nach `managed_components/`:
 * `espressif/bme280` 0.1.1 + `espressif/i2c_bus` 1.5.2 (Sensor am I²C-Bus; die
   i2c_bus-Version nutzt ab ESP-IDF 5.3 den neuen `i2c_master`-Treiber, der alte
   `driver/i2c.h` existiert in IDF 6 nicht mehr)
+* `espressif/esp_jpeg` 1.3.1 (JPEG-Decoder für die Wallpaper)
 
 Zum Testen ohne Hardware genügt `.\idf build` – es ist bereits erfolgreich
-durchgelaufen (App-Binärdatei 192 KB in einer 3008-KB-Partition, Flash 4 MB,
+durchgelaufen (App-Binärdatei 434 KB inklusive 147 KB Schrift in einer
+3008-KB-Partition, Flash 4 MB,
 CPU 240 MHz).
 
 ## Projektstruktur
 
 | Datei | Zweck |
 |---|---|
-| [main/main.c](main/main.c) | Ablauf: Backlight, LCD-Init, Testbild, Statuszeile, Touch-Auswertung |
-| [main/board_e32r28t.h](main/board_e32r28t.h) | Alle Pins, Auflösung, SPI-Takt, Farb- und Touch-Kalibrierwerte |
+| [main/main.c](main/main.c) | Ablauf: Backlight, LCD-Init, littlefs, Sensor, Thermometer-Schleife (`APP_SHOW_TESTSCREEN` schaltet das Testbild ein) |
+| [main/board_e32r28t.h](main/board_e32r28t.h) | Alle Pins, Auflösung, Ausrichtung, SPI-Takt, Farb- und Touch-Kalibrierwerte |
+| [main/wallpaper.c](main/wallpaper.c), [main/wallpaper.h](main/wallpaper.h) | JPEG → Canvas, Slot-Auswahl über `background.h`, Jahreszeit/Tageszeit aus Datum/Uhrzeit |
+| [main/bigdigit.c](main/bigdigit.c), [main/bigdigit.h](main/bigdigit.h) | Große Temperaturanzeige `xx,x°` mit dem TrueType-Renderer |
+| [main/layout.h](main/layout.h) | Alle Layout-Werte der Anzeige (Kachel, Ziffernhöhe, Komma-/Gradgröße) |
+| [main/ttf.c](main/ttf.c), [main/ttf.h](main/ttf.h) | TrueType-Text: `stb_truetype`, Anti-Aliasing, Stauchung |
+| [main/fonts/OpenSans-Regular.ttf](main/fonts) | Schrift (Apache 2.0), per `EMBED_FILES` im App-Image |
+| [main/testscreen.c](main/testscreen.c), [main/testscreen.h](main/testscreen.h) | Hardware-Testbild, Statuszeile, Touch-Punkte, BOOT-Neudruck (separat entfernbar) |
+| [main/statusled.c](main/statusled.c), [main/statusled.h](main/statusled.h) | RGB-LED inkl. Selbsttest |
 | [main/gfx.c](main/gfx.c), [main/gfx.h](main/gfx.h) | Mini-Grafikbibliothek: Canvas, Rechtecke, Linien, Kreis, Text, Flush |
+| [main/gfx_color.h](main/gfx_color.h) | RGB565-Farbmakros, ohne ESP-IDF-Abhängigkeit (auch für Datentabellen nutzbar) |
 | [main/font5x7.c](main/font5x7.c), [main/font5x7.h](main/font5x7.h) | 5×7-Pixel-Font (A–Z, 0–9, Satzzeichen), generiert |
 | [main/touch.c](main/touch.c), [main/touch.h](main/touch.h) | XPT2046: SPI-Bus, `esp_lcd_touch`, Rohwert → Bildschirmkoordinate |
 | [main/storage.c](main/storage.c), [main/storage.h](main/storage.h) | littlefs: Mount der `storage`-Partition, Belegung, Dateizählung |
 | [main/sensor.c](main/sensor.c), [main/sensor.h](main/sensor.h) | BME280: I²C-Bus, Sensor-Init, Temperatur/Feuchte/Druck |
+| [main/background.h](main/background.h) | Tabelle der 48 Wallpaper-Dateinamen und Textfarben je Jahreszeit/Tageszeit |
 | [data/](data) | Inhalt der littlefs-Partition (Wallpaper), wird beim Bauen zum Image |
 | [main/idf_component.yml](main/idf_component.yml) | Abhängigkeiten aus der Component Registry |
 | [tools/gen_font5x7.py](tools/gen_font5x7.py) | Erzeugt den Font neu (Glyphen als ASCII-Art, mit Probedruck) |
@@ -348,15 +427,24 @@ I (xxx) gfx: canvas 320x240: framebuffer 153600 bytes, bounce buffer 15360 bytes
 I (xxx) cyd: test pattern drawn, backlight on - press BOOT (GPIO0) to redraw
 I (xxx) touch: SPI3 for XPT2046: SCK=25 MOSI=32 MISO=39 CS=33
 I (2464) touch: XPT2046 ready, raw axes 300..3805 / 215..3712, swap=1 mirror=1/1
-I (2474) storage: littlefs mounted at /littlefs: 1024 KiB total, 1008 KiB free
-I (4464) storage: 0 files in total (0 JPEG), 0 bytes
-I (4464) sensor: I2C0 for BME280: SDA=23 SCL=27, 100 kHz, address 0x76
-I (4464) i2c_bus: I2C Bus V2 uses the externally initialized bus handle
-I (4864) sensor: BME280 ready, first reading: 23.88 C, 45.8 %rH, 965.5 hPa
-I (4864) cyd: 123624 free heap bytes after initialisation
-I (4864) cyd: BME280: 23.88 C, 45.8 %rH, 965.5 hPa
-I (6874) cyd: BME280: 23.97 C, 45.8 %rH, 965.4 hPa
-I (xxx) cyd: TOUCH: RAW 1234/2345 -> 120/160  Z 900     (beim Berühren, max. 5/s)
+I (2436) cyd: ILI9341 ready, 240x320 portrait, 40 MHz SPI clock, BGR element order
+I (2436) gfx: canvas 240x320: framebuffer 153600 bytes, bounce buffer 11520 bytes
+I (2546) storage: littlefs mounted at /littlefs: 1024 KiB total, 36 KiB free
+…   (16 Ordnerzeilen, je 3 Dateien)
+I (4446) storage: 48 files in total (48 JPEG), 728964 bytes
+I (4446) sensor: I2C0 for BME280: SDA=23 SCL=27, 100 kHz, address 0x76
+I (4456) i2c_bus: I2C Bus V2 uses the externally initialized bus handle
+I (4846) sensor: BME280 ready, first reading: 21.08 C, 49.5 %rH, 967.2 hPa
+I (4930) touch: XPT2046 ready, raw axes 300..3805 / 215..3712, swap=0 mirror=1/0
+I (4940) ttf: 147528 byte font loaded, ascent 2189 / descent -600 / gap 0 (font units)
+I (4950) cyd: 126580 free heap bytes after initialisation
+I (4950) cyd: wallpaper slot 1/2/1: /littlefs/backgrounds/summer/evening/ocean-sunset.jpg, text colour 0x1F00
+I (5070) wallpaper: …/ocean-sunset.jpg: 240x320, 14222 bytes JPEG -> RGB565
+I (5080) bigdigit: "21,8" cap 120 px, scale x/y 0.060/0.082, from x=25 on baseline y=175, 187 px wide
+I (5080) bigdigit: degree: 27x25 px ink, top right corner at (215,25)
+I (5110) cyd: frame: 21,8 degC, text from (25,175), 187 px wide, degree at (215,25), decode 103 ms, total 148 ms
+I (15110) cyd: BME280: 21.92 C, 47.1 %rH, 967.3 hPa
+I (15220) bigdigit: "21,9" cap 120 px, scale x/y 0.060/0.082, from x=25 on baseline y=175, 187 px wide
 ```
 
 ## Fehlersuche
@@ -365,6 +453,7 @@ I (xxx) cyd: TOUCH: RAW 1234/2345 -> 120/160  Z 900     (beim Berühren, max. 5/
 |---|---|
 | Kein Log auf dem Monitor | Falscher COM-Port, USB-Kabel ohne Datenleitungen, BOOT gedrückt halten und EN/RESET tippen |
 | „cannot open source file stdio.h" (IntelliSense) | `.vscode/c_cpp_properties.json` prüfen: `compilerPath` muss auf die vorhandene `xtensa-esp32-elf-gcc.exe` zeigen und `compileCommands` auf die gebaute `build/compile_commands.json` (erst nach einem Build vorhanden). Danach „C/C++: Reset IntelliSense Database" |
+| Include-Fehler in einem Header, obwohl der Build läuft | Der Header gehört zu keinem `.c` und wird von IntelliSense nur mit dem Projekt-Suchpfad geprüft. Keine ESP-IDF-Header darin einbinden – reine Tabellen nutzen [gfx_color.h](main/gfx_color.h) statt [gfx.h](main/gfx.h), Details im Abschnitt [IntelliSense in VS Code](#intellisense-in-vs-code) |
 | `idf.py` wird nicht erkannt (`CommandNotFoundException`) | `idf.py` liegt bei EIM-Installationen nicht im PATH. Entweder `.\idf build` (Wrapper im Projekt) oder die ESP-IDF-Umgebung laden, siehe [Auf der Kommandozeile](#auf-der-kommandozeile) |
 | „Die Ausführung von Skripts ist auf diesem System deaktiviert" | PowerShell-ExecutionPolicy ist `Restricted` (Windows-Standard). Entweder den Wrapper `.\idf` nutzen oder einmalig `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` ausführen |
 | `partition 'storage' not found` / littlefs meldet `ESP_ERR_NOT_FOUND` | Partitionstabelle im Flash ist noch die alte: `.\idf -p COM8 flash` (schreibt sie an 0x8000 mit). Prüfen mit `.\idf partition-table` |
@@ -374,6 +463,14 @@ I (xxx) cyd: TOUCH: RAW 1234/2345 -> 120/160  Z 900     (beim Berühren, max. 5/
 | BME280 meldet `no BME280 at 0x76` | SDA/SCL vertauscht oder nicht kontaktiert (SDA = IO23/P3-Pin1, SCL = IO27/P3-Pin4), 3V3/GND fehlen, oder die Adressbrücke ist nicht auf 0x76 (SDO an GND). Pull-ups: Breakout hat 10 kΩ, sonst 4,7 kΩ nach 3V3 ergänzen |
 | BME280 liefert unsinnige Werte | Sensor kurz vorher verlötet/angefasst – Selbstaufheizung; 1–2 Minuten warten. Druck wird in hPa ausgegeben (965,5 hPa entspricht ca. 400 m Höhe) |
 | `Could not open COM8, the port is busy` beim Flashen | Ein noch laufender Monitor hält den Port: im Monitor `Strg+]`, sonst das Fenster schließen, dann erneut flashen |
+| `undefined reference to 'app_main'` | `main.c` fehlt in der `SRCS`-Liste von [main/CMakeLists.txt](main/CMakeLists.txt) – passiert, wenn die ESP-IDF-Erweiterung die Liste synchronisiert, während die Datei kurzzeitig gelöscht war. Datei wieder eintragen |
+| Wallpaper erscheint, aber die Farben stimmen nicht (grün/lila) | Byte-Reihenfolge des JPEG-Ergebnisses: `flags.swap_color_bytes` in [wallpaper.c](main/wallpaper.c) umschalten |
+| Bild steht auf dem Kopf | `BOARD_LCD_MIRROR_X` **und** `BOARD_LCD_MIRROR_Y` in [board_e32r28t.h](main/board_e32r28t.h) umschalten (180°-Drehung) – danach auch `BOARD_TOUCH_MIRROR_X/Y` umschalten, sonst passt der Touch nicht mehr |
+| Schrift wirkt zu schmal/gestaucht | `LAYOUT_TEMP_MIN_SQUEEZE` in [layout.h](main/layout.h) erhöhen (1.0 = nie stauchen, Schrift wird stattdessen kleiner) |
+| Schrift/° zu groß oder zu klein | `LAYOUT_TEMP_DIGIT_HEIGHT` bzw. `LAYOUT_TEMP_DEGREE_SCALE` in [layout.h](main/layout.h) – Kontrolle über die `bigdigit:`-Zeilen im Log |
+| Text sitzt an der falschen Stelle | `LAYOUT_TEMP_X` / `LAYOUT_TEMP_BASELINE_Y` bzw. `LAYOUT_TEMP_DEGREE_X/Y` in [layout.h](main/layout.h) |
+| Kein Text, Log zeigt `font could not be loaded` | `fonts/OpenSans-Regular.ttf` fehlt oder ist beschädigt; Datei prüfen und neu bauen (`EMBED_FILES` in [main/CMakeLists.txt](main/CMakeLists.txt)) |
+| Touch trifft um 90° versetzt | Touch-Flags passend zur Anzeige: `BOARD_TOUCH_SWAP_XY` / `BOARD_TOUCH_MIRROR_X/Y` – siehe [Touch-Kalibrierung](#touch-kalibrierung) |
 | Bildschirm bleibt dunkel, Log endet mit `cyd: LCD bring-up failed` | Fehlerzeile darüber lesen (SPI/Registrierung). Backlight an GPIO21 prüfen – manche Board-Revisionen nutzen GPIO27 (`BOARD_LCD_PIN_BACKLIGHT`) |
 | Bild ist da, aber wie ein Negativ | `BOARD_LCD_INVERT_COLORS` auf `1` setzen |
 | Rot und Blau vertauscht | `BOARD_LCD_BGR` auf `0` setzen |
@@ -389,12 +486,12 @@ I (xxx) cyd: TOUCH: RAW 1234/2345 -> 120/160  Z 900     (beim Berühren, max. 5/
 ### Touch-Kalibrierung
 
 Die Werte in [board_e32r28t.h](main/board_e32r28t.h) sind auf diesem Board
-bereits eingemessen: der Touchscreen ist gegenüber dem Display um 90° gedreht,
-und beide Rohachsen zählen verkehrt herum, deshalb sind `BOARD_TOUCH_SWAP_XY`
-und `BOARD_TOUCH_MIRROR_X/Y` alle `1`.
+bereits eingemessen. Im **Hochformat** folgt `raw_x` der Bildschirm-X-Achse und
+`raw_y` der Y-Achse, wobei `raw_y` verkehrt herum zählt; deshalb
+`BOARD_TOUCH_SWAP_XY 0`, `BOARD_TOUCH_MIRROR_X 0`, `BOARD_TOUCH_MIRROR_Y 1`.
 
-Gemessene Rohwerte an den Bildecken (Querformat 320×240), zweite, genauere
-Messreihe:
+Gemessene Rohwerte an den Bildecken (damals im Querformat 320×240), zweite,
+genauere Messreihe:
 
 | Ecke | RAW x/y |
 |---|---|
@@ -403,15 +500,12 @@ Messreihe:
 | unten links | 283 / 3704 |
 | unten rechts | 323 / 214 |
 
-Also wächst `raw_x` nach oben (300 = Unterkante, 3805 = Oberkante) und `raw_y`
-nach links (215 = rechte Kante, 3712 = linke Kante). Wegen des Tauschs
-kalibrieren die `..._X`-Werte die Bildschirm-**Y**-Achse und die `..._Y`-Werte
-die Bildschirm-**X**-Achse.
-
-Zum Nachkalibrieren:
+Damit gilt: `raw_x` von 300 bis 3805 und `raw_y` von 215 bis 3712 decken jeweils
+eine Bildschirmkante ab. Zum Nachkalibrieren:
 
 1. An jeder Ecke des Bildschirms drücken und im Monitor die Zeile
-   `cyd: TOUCH: RAW xxxx/yyyy` ablesen (max. 5 Ausgaben pro Sekunde).
+   `testscreen: TOUCH: RAW xxxx/yyyy` ablesen (Testbild mit
+   `APP_SHOW_TESTSCREEN 1`).
 2. Die äußersten Werte in `BOARD_TOUCH_RAW_MIN/MAX_X/Y` eintragen (kleiner Wert
    in `MIN`, großer Wert in `MAX`), gerne ein paar Zähler nach außen gerundet –
    Werte außerhalb des Fensters werden begrenzt, die Randpixel bleiben also
@@ -420,16 +514,16 @@ Zum Nachkalibrieren:
    falls eine Achse spiegelverkehrt läuft: das passende `BOARD_TOUCH_MIRROR_*`
    umschalten.
 
-Mit den eingestellten Werten ergeben sich für die vier Eckberührungen und die
-Bildschirmmitte (Mittelwert der vier Eckmesswerte):
+Im Hochformat ergeben die Ecken (Umrechnung mit denselben Werten):
 
-| Berührung | RAW x/y | → x/y | Sollwert | Abweichung |
-|---|---|---|---|---|
-| oben links | 3791 / 3714 | 0 / 1 | 0 / 0 | 1 px |
-| oben rechts | 3808 / 218 | 319 / 0 | 319 / 0 | 0 px |
-| unten links | 283 / 3704 | 1 / 239 | 0 / 239 | 1 px |
-| unten rechts | 323 / 214 | 319 / 238 | 319 / 239 | 1 px |
-| Mitte | 2051 / 1962 | 160 / 120 | 160 / 120 | 0 px |
+| Berührung (Querformat gemessen) | RAW x/y | Hochformat x/y | erwartete Ecke |
+|---|---|---|---|
+| oben links | 3791 / 3714 | 238 / 0 | oben rechts |
+| oben rechts | 3808 / 218 | 239 / 319 | unten rechts |
+| unten links | 283 / 3704 | 0 / 1 | oben links |
+| unten rechts | 323 / 214 | 1 / 319 | unten links |
+
+Die 0/1-Abweichungen sind die übliche Streuung beim Antippen (1–3 px).
 
 Die letzte Messreihe lag gegenüber der ersten rund 200 Zähler weiter außen (die
 Ecken wurden genauer getroffen); die erste Messreihe würde mit diesen Werten
@@ -448,12 +542,17 @@ Abhängigkeiten selbst nach. `sdkconfig.defaults` wirkt nur bei neu erzeugter
 1. ~~Partitionierung~~ – erledigt, siehe [Flash-Aufteilung](#flash-aufteilung)
 2. ~~littlefs + Wallpaper~~ – erledigt, siehe [Wallpaper-Ablage](#wallpaper-ablage)
 3. ~~BME280~~ – erledigt: SDA = IO23, SCL = IO27, Adresse 0x76
-4. NTP-Zeit über WLAN holen (`esp_sntp`), Zeitzone Europe/Berlin
-5. Anzeige im Hochformat: große Temperaturziffern, kleines `°`, Feuchte darunter,
-   Zeile mit Uhrzeit/Datum, Wallpaper im Hintergrund
-6. HTTP-Server mit JSON-Endpunkt für Temperatur/Luftfeuchte
-7. Bildauswahl: Jahreszeit aus dem Datum, Tageszeit aus der Uhrzeit, Zufall aus
-   den drei JPEGs pro Slot, JPEG-Decoder (z. B. `espressif/esp_jpeg`)
+4. ~~Hochformat + Testbild ausgelagert~~ – erledigt: `testscreen.c`, Anzeige 240×320
+5. ~~JPEG-Anzeige~~ – erledigt: `wallpaper.c`, `ocean-sunset.jpg` wird dekodiert
+6. ~~Temperatur im Großformat~~ – erledigt: `bigdigit.c`, Kachel x 25…215 / y 25…175
+7. Luftfeuchte `xx,x %rF` in der zweiten Glasfläche (halb so große Schrift)
+8. NTP-Zeit über WLAN holen (`esp_sntp`), Zeitzone Europe/Berlin, Uhrzeit/Datum-Block
+9. Bildauswahl automatisch: Jahreszeit aus dem Monat, Tageszeit aus der Stunde
+   (Helfer `wallpaper_season_from_month()` / `wallpaper_daytime_from_hour()` sind
+   schon vorhanden), Zufall aus den drei Bildern per `wallpaper_random_index()`
+10. HTTP-Server mit JSON-Endpunkt für Temperatur/Luftfeuchte
+11. Feinschliff: beim Neuzeichnen nur die Werte-Kachel aktualisieren statt des
+    ganzen Frames (spart das JPEG-Dekodieren, aktuell 102 ms pro Frame)
 
 Optional, nicht für das Raumthermometer nötig:
 

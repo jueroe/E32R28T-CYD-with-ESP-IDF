@@ -33,14 +33,19 @@
 #define BOARD_LCD_H_RES           240
 #define BOARD_LCD_V_RES           320
 
-/* 1 = 320x240 landscape (recommended for this board), 0 = 240x320 portrait.
- * If the picture appears rotated or mirrored, flip the two mirror flags. */
-#define BOARD_LCD_LANDSCAPE       1
-/* Landscape via MADCTL bit MV; on this unit both mirrors are needed for an
- * upright, non-mirrored picture.  Changing them also rotates the touch
- * coordinates, see the touch section below. */
+/* 1 = 320x240 landscape, 0 = 240x320 portrait.
+ *
+ * The application runs in portrait: screen origin (0,0) is the top left corner,
+ * x grows to the right up to BOARD_SCREEN_WIDTH-1 = 239, y grows down to 319.
+ * This is the earlier landscape picture rotated by 90 degrees clockwise, which
+ * is what the wallpapers (240x320 JPEGs) expect.
+ *
+ * MADCTL mapping of the flags: MX = mirror_x, MY = mirror_y, MV = !portrait.
+ * The landscape setting was MX|MY|MV; rotating the content by 90 degrees
+ * clockwise keeps MV off and leaves only MY -> portrait, mirror_y only. */
+#define BOARD_LCD_LANDSCAPE       0
 #define BOARD_LCD_MIRROR_X        1
-#define BOARD_LCD_MIRROR_Y        1
+#define BOARD_LCD_MIRROR_Y        0
 
 #if BOARD_LCD_LANDSCAPE
 #define BOARD_SCREEN_WIDTH        BOARD_LCD_V_RES
@@ -87,37 +92,36 @@
  * The XPT2046 is read as a raw 12 bit ADC value (0..4095) and mapped to screen
  * coordinates here.
  *
- * On this panel the touch axes are rotated by 90 degrees against the display
- * and both raw values count the other way round (large raw value = small
- * screen coordinate), so swap_xy and both mirror flags are enabled.
+ * The touch panel is rotated by 90 degrees against the display, so in the
+ * portrait layout raw_x follows the screen X axis and raw_y the screen Y axis;
+ * both count backwards (large value = small screen coordinate).
  *
- * Measured on this unit when touching the four corners of the screen (values
- * logged by main.c as "TOUCH: RAW x/y"):
+ * Measured on this unit when touching the four corners (landscape view, which
+ * was the layout at the time of the measurement; "TOUCH: RAW x/y" in the log):
  *     top left     3791/3714        top right     3808/218
  *     bottom left   283/3704        bottom right   323/214
- * so raw_x grows towards the top edge (283 = bottom, 3808 = top) and raw_y
- * towards the left edge (214 = right, 3714 = left).  Touching the same corner
- * again varies these values by a few dozen counts, hence the window below is
- * rounded slightly outwards; readings outside it are clamped, so the outermost
- * pixel rows and columns stay reachable.
+ * so raw_x grows towards one edge (283 = bottom, 3808 = top) and raw_y towards
+ * the other (214 = right, 3714 = left).  Touching the same corner again varies
+ * these values by a few dozen counts, hence the window below is rounded
+ * slightly outwards; readings outside it are clamped, so the outermost pixel
+ * rows and columns stay reachable.
  *
- * With these values the four corners map to (0,1) (319,0) (1,239) (319,238)
- * and the screen centre to (160,120).
+ * In the current portrait layout (MADCTL MX, i.e. the landscape picture turned
+ * by 180 degrees) the corners map to top left (0,0), top right (239,0),
+ * bottom left (0,319) and bottom right (239,319); the centre is (120,160).
  *
- * Because of the swap, the X macros calibrate the screen Y axis and the Y
- * macros the screen X axis.  To re-calibrate: touch each corner, read the RAW
- * values from the serial log and put the outermost values into the macros
- * below.  These flags also depend on the display orientation
- * (BOARD_LCD_LANDSCAPE / BOARD_LCD_MIRROR_*) - if that is changed, the mirror
- * flags here normally have to be flipped too.
+ * To re-calibrate: touch each corner, read the RAW values from the serial log
+ * and put the outermost values into the macros below.  These flags depend on
+ * the display orientation (BOARD_LCD_LANDSCAPE / BOARD_LCD_MIRROR_*) - if that
+ * is changed, they normally have to be changed too.
  */
-#define BOARD_TOUCH_SWAP_XY       1
+#define BOARD_TOUCH_SWAP_XY       0
 #define BOARD_TOUCH_MIRROR_X      1
-#define BOARD_TOUCH_MIRROR_Y      1
-/* raw_x -> screen Y: 300 = bottom edge, 3805 = top edge */
+#define BOARD_TOUCH_MIRROR_Y      0
+/* raw_x -> screen X: 300 = left edge, 3805 = right edge */
 #define BOARD_TOUCH_RAW_MIN_X     300
 #define BOARD_TOUCH_RAW_MAX_X     3805
-/* raw_y -> screen X: 215 = right edge, 3712 = left edge */
+/* raw_y -> screen Y: 215 = bottom edge, 3712 = top edge (mirrored by MIRROR_Y) */
 #define BOARD_TOUCH_RAW_MIN_Y     215
 #define BOARD_TOUCH_RAW_MAX_Y     3712
 /*
