@@ -28,11 +28,12 @@ CONFIG_LITTLEFS_OBJ_NAME_LEN=128
 # BOARD_TOUCH_Z_THRESHOLD in main/board_e32r28t.h.
 CONFIG_XPT2046_Z_THRESHOLD=250
 
-# WiFi buffers live in static RAM and every kilobyte counts here: the 240x320
-# framebuffer needs 150 KB in one piece, and the WiFi stack alone takes ~30 KB
-# of the 192 KB DRAM segment.  A thermometer needs neither an access point of
-# its own nor WPA3-Enterprise, so those features stay out of the build.
-CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+# WiFi buffers live in static RAM and every kilobyte counts here: the band
+# framebuffer needs 77 KB, and the WiFi stack alone takes ~30 KB of the 192 KB
+# DRAM segment.  A thermometer needs neither WPA3-Enterprise nor WPS, so those
+# stay out.  The access point *is* needed: without it the WLAN cannot be
+# configured on the device (see main/configmode.c).
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
 CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
 

@@ -11,6 +11,7 @@
 #include "esp_sntp.h"
 
 #include "connect.h"
+#include "netcfg.h"
 
 static const char *TAG = "clock";
 
@@ -116,7 +117,7 @@ void clock_set_sun_times(int rise_hour, int rise_minute, int set_hour, int set_m
 void clock_log_now(void)
 {
     log_with_prefix("time is");
-    ESP_LOGI(TAG, "sun at %s: rise %02d:%02d%s, set %02d:%02d%s", CONNECT_LATITUDE_TEXT,
+    ESP_LOGI(TAG, "sun at %s: rise %02d:%02d%s, set %02d:%02d%s", netcfg_latitude(),
              s_sunrise.hour, s_sunrise.minute, s_sunrise.valid ? "" : " (placeholder)",
              s_sunset.hour, s_sunset.minute, s_sunset.valid ? "" : " (placeholder)");
 }

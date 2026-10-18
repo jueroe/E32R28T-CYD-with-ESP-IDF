@@ -11,6 +11,11 @@ idf_component_register(SRCS
                             "infotile.c"
                             "clock.c"
                             "wifi.c"
+                            "netcfg.c"
+                            "configmode.c"
+                            "webserver.c"
+                            "discovery.c"
+                            "textutil.c"
                             "sun.c"
                             "tjpgd/tjpgd.c"
                             "ttf.c"
@@ -32,6 +37,8 @@ idf_component_register(SRCS
                                 esp_wifi
                                 lwip
                                 nvs_flash
+                                esp_http_server
+                                mdns
                                 esp_http_client
                                 esp-tls
                                 mbedtls

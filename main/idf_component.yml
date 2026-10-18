@@ -14,3 +14,7 @@ dependencies:
 
   ## BME280 temperature/humidity/pressure sensor (includes espressif/i2c_bus)
   espressif/bme280: "^0.1.1"
+
+  ## mDNS responder: makes the unit reachable as <hostname>.local, independent
+  ## of the router's DNS (not part of ESP-IDF 6.x any more)
+  espressif/mdns: "^1.14.0"

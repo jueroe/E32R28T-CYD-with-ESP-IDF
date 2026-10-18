@@ -6,7 +6,9 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "i2c_bus.h"
 
@@ -19,8 +21,22 @@ static i2c_bus_handle_t s_bus;
 static bme280_handle_t s_bme280;
 static bool s_available;
 
+/* Last successful reading, so the HTTP endpoint can answer without touching the
+ * I2C bus (the display task reads once every 10 s). */
+static sensor_reading_t s_last;
+static int64_t s_last_us;
+static bool s_last_valid;
+static SemaphoreHandle_t s_last_lock;
+
 esp_err_t sensor_init(void)
 {
+    if (s_last_lock == NULL) {
+        s_last_lock = xSemaphoreCreateMutex();
+        if (s_last_lock == NULL) {
+            ESP_LOGE(TAG, "no memory for the reading lock");
+            return ESP_ERR_NO_MEM;
+        }
+    }
     /* The bus is created here instead of inside i2c_bus_create(): the latter
      * probes an existing bus with i2c_master_get_bus_handle(), which logs an
      * error when the port is not initialised yet.  Creating it first is the
@@ -111,5 +127,33 @@ esp_err_t sensor_read(sensor_reading_t *reading)
     if (err == ESP_OK) {
         err = bme280_read_pressure(s_bme280, &reading->pressure_hpa);
     }
+
+    if (err == ESP_OK && s_last_lock != NULL) {
+        xSemaphoreTake(s_last_lock, portMAX_DELAY);
+        s_last = *reading;
+        s_last_us = esp_timer_get_time();
+        s_last_valid = true;
+        xSemaphoreGive(s_last_lock);
+    }
     return err;
+}
+
+bool sensor_last(sensor_reading_t *reading, int64_t *age_ms)
+{
+    if (s_last_lock == NULL) {
+        return false;
+    }
+
+    xSemaphoreTake(s_last_lock, portMAX_DELAY);
+    const bool valid = s_last_valid;
+    if (valid) {
+        if (reading != NULL) {
+            *reading = s_last;
+        }
+        if (age_ms != NULL) {
+            *age_ms = (esp_timer_get_time() - s_last_us) / 1000;
+        }
+    }
+    xSemaphoreGive(s_last_lock);
+    return valid;
 }

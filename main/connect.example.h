@@ -12,8 +12,17 @@
 
 #define CONNECT_WIFI_SSID       "your-network-name"
 #define CONNECT_WIFI_PASSWORD   "your-password"
-#define CONNECT_HOSTNAME        "raumthermometer"
+#define CONNECT_DEVICE_NAME     "Raumthermometer"
 #define CONNECT_WIFI_TIMEOUT_MS 20000
+
+/* Skip the connection attempt when the network is weaker than this, and open the
+ * configuration access point instead */
+#define CONNECT_MIN_RSSI        (-85)
+
+/* Access point of the device for the WLAN configuration (password needs at
+ * least 8 characters, "" makes it open) */
+#define CONNECT_AP_SSID         "thermometer"
+#define CONNECT_AP_PASSWORD     "thermometer"
 
 #define CONNECT_SNTP_SERVER     "de.pool.ntp.org"
 #define CONNECT_SNTP_WAIT_MS    15000
@@ -22,8 +31,5 @@
 
 #define CONNECT_LATITUDE_TEXT   "48.41490736914154"
 #define CONNECT_LONGITUDE_TEXT  "11.099721982616911"
-#define CONNECT_SUN_API_URL \
-    "https://api.sunrise-sunset.org/json?lat=" CONNECT_LATITUDE_TEXT \
-    "&lng=" CONNECT_LONGITUDE_TEXT "&formatted=0"
 #define CONNECT_SUN_TIMEOUT_MS  10000
 #define CONNECT_SUN_REFRESH_S   21600

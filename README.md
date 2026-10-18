@@ -79,17 +79,28 @@ Durchläufe.
 | Posten | Größe |
 |---|---|
 | DRAM-Segment für Daten insgesamt | 192 KB |
-| davon statisch (Bibliotheken, WiFi, LVGL-frei, App) | ~40 KB |
+| davon statisch (Bibliotheken, WiFi, App) | 41 KB |
 | Canvas 240×160 (ein Band) | 77 KB |
 | JPEG im RAM (größtes Wallpaper) | ~20 KB |
 | TJpgDec-Arbeitsspeicher | 4 KB |
-| **frei nach der Initialisierung** | **~166 KB** |
+| **frei nach der Initialisierung** | **~184 KB** |
 | davon nimmt sich WiFi zur Laufzeit (Puffer, DHCP, lwIP) | ~40–60 KB |
 
 Ein voller Framebuffer hätte 150 KB gekostet und wäre damit nicht mehr
-unterzubringen gewesen. Für den HTTP-Server ist mit ~100 KB Rest reichlich Platz;
-die HTTPS-Abfrage der Sonnenzeiten belegt während des Handshakes kurzzeitig
-~25–30 KB und gibt sie danach wieder frei.
+unterzubringen gewesen. Die HTTPS-Abfrage der Sonnenzeiten belegt während des
+Handshakes kurzzeitig ~25–30 KB und gibt sie danach wieder frei.
+
+Für den Konfigurationsmodus (Access Point + HTTP-Server) bleiben gemessen
+**120 KB frei mit 69 KB im größten Block**, nachdem Access Point und Webserver
+laufen – die Sonnenzeiten-Abfrage läuft in dieser Zeit nicht:
+
+| Posten im Konfigurationsmodus | Größe |
+|---|---|
+| Scan-Ergebnis (16 Netze, `wifi_ap_record_t` je 92 Bytes) | 1,5 KB |
+| Access Point (Netzwerkschnittstelle, DHCP-Server) | ~8 KB |
+| HTTP-Server der Einrichtung (Task-Stack 6 KB, 3 Sockets) | ~15 KB |
+| mDNS-Responder | 5,5 KB |
+| HTML-Seite (Heap, nur während einer Anfrage) | 6 KB |
 
 ### Layout einstellen – [main/layout.h](main/layout.h)
 
@@ -126,6 +137,11 @@ Zeilenhöhen, der Block wird darin automatisch mittig gesetzt.
 | `LAYOUT_INFO_TIME_CAP` | Ziffernhöhe der Zeile `dd.mm. hh:mm` | 18 |
 | `LAYOUT_INFO_GAP` | Abstand zwischen den Zeilen | 8 |
 | `LAYOUT_INFO_MIN_SQUEEZE` | stärkste Stauchung je Zeile; greift sie nicht, wird die Zeile kleiner | 0.6 |
+| `LAYOUT_CONFIG_TRIGGER_X/Y/W/H` | Rechteck, das den Konfigurationsmodus öffnet (Ecke oben rechts) | 180, 0, 60, 60 |
+| `LAYOUT_CONFIG_HOLD_MS` | so lange muss der Finger dort liegen | 500 |
+| `LAYOUT_CONFIG_BACK_Y/H` | Zurück-Schaltfläche, volle Breite | 264, 56 |
+| `LAYOUT_CONFIG_TITLE_CAP` … `_BUTTON_CAP` | Ziffernhöhen des Einrichtungsbildschirms | 22/12/14/26/13/18 |
+| `LAYOUT_CONFIG_*_Y` | Grundlinien der Zeilen | siehe Datei |
 
 Dazu kommt `LAYOUT_BAND_HEIGHT` (160): die Höhe der Bänder, in denen gezeichnet
 wird (siehe oben). Sie muss `BOARD_SCREEN_HEIGHT` ohne Rest teilen und bestimmt
@@ -165,10 +181,131 @@ Regeln, die der Renderer anwendet:
   NTP-Uhr; solange die nicht synchronisiert ist, zeigen die Zeilen die
   Rückfallwerte `APP_FALLBACK_*` aus [main/main.c](main/main.c) (`01.01. 00:00`).
 
+## WLAN einrichten – [main/configmode.c](main/configmode.c), [main/netcfg.c](main/netcfg.c)
+
+SSID, Passwort und Standort müssen **nicht mehr im Quelltext** stehen: das Gerät
+lässt sich direkt am Bildschirm bzw. über eine kleine Webseite einrichten, und
+die Werte überleben den Neustart im NVS.
+
+### Wann der Konfigurationsmodus startet
+
+| Auslöser | Bedingung |
+|---|---|
+| Netzwerk nicht erreichbar | SSID nicht im Scan **oder** schwächer als `CONNECT_MIN_RSSI` (-85 dBm) → Verbindungsversuch wird übersprungen; sonst Verbindungsversuch, und wenn der scheitert, ebenfalls Konfigurationsmodus |
+| Finger im Eck | Rechteck `LAYOUT_CONFIG_TRIGGER_*` in [layout.h](main/layout.h) = x 180…239, y 0…59, **500 ms halten** (`LAYOUT_CONFIG_HOLD_MS`), damit ein Streifen nicht umschaltet |
+
+Der Bildschirm zeigt dann Hotspot-Name, Passwort und Adresse:
+
+```
+        WLAN einrichten
+     kein Netzwerk - bitte einrichten
+1. Mit dem Hotspot verbinden
+          thermometer
+      Passwort: thermometer
+2. Im Browser öffnen
+      http://192.168.4.1
+<- zurück zur APP   (ganze untere Kante)
+```
+
+Am Telefon oder PC mit dem Hotspot `CONNECT_AP_SSID` verbinden, im Browser
+`http://192.168.4.1` öffnen. Die Seite zeigt oben den Gerätenamen und bietet:
+
+| Feld | Zweck |
+|---|---|
+| **Name dieses Geräts** | erscheint im Browser, im JSON, im Log und als Hostname im Router (siehe unten) |
+| **Netzwerk** | Auswahlliste der gefundenen Netze (nach Signalstärke, **ein Eintrag pro Name** – Mesh und 2,4/5-GHz-Doppeleinträge werden zusammengefasst) |
+| **Anderes Netzwerk** | Freitext für versteckte oder gerade nicht sichtbare Netze, hat Vorrang vor der Liste |
+| **Passwort** | leer lassen für ein offenes Netz |
+| **Breite / Länge** | Koordinaten für die Sonnenzeiten, leer = bisheriger Wert bleibt |
+| **Außensensor** | IP-Adresse eines zweiten Geräts, leer = keiner (Feld ist vorbereitet, abgefragt wird es noch nicht) |
+
+| Schaltfläche | Ergebnis |
+|---|---|
+| **Speichern** | Werte in NVS, Antwortseite, **Neustart** nach 1,5 s → Anmeldung im neuen Netz |
+| **Abbrechen** | nichts wird geändert, Seite kann geschlossen werden |
+| **Netzwerke neu suchen** | neuer Scan |
+| **`<- zurück zur APP`** (am TFT) | NVS-Merker „Konfiguration übersprungen“, **Neustart** → Anzeige läuft ohne Netz weiter |
+
+Beide Wege enden in einem Neustart. Das ist Absicht: der Netzwerkteil läuft in
+einer eigenen Task, und ein Neustart ist der einzige Zustand, der garantiert
+sauber ist. Der Merker „übersprungen“ verhindert, dass ein Gerät ohne WLAN bei
+jedem Start wieder im Konfigurationsmodus landet – der Eck-Touch funktioniert
+weiterhin. Ein neues Speichern löscht den Merker.
+
+### Werte und Speicherung
+
+`connect.h` liefert nur noch die **Vorgaben für den ersten Start**. Sobald etwas
+im NVS steht, gilt das:
+
+| NVS-Schlüssel (Namespace `net`) | Inhalt |
+|---|---|
+| `ssid`, `pass` | WLAN-Zugang |
+| `lat`, `lon` | Koordinaten als Text (Dezimalgrad) |
+| `name` | Gerätename, Vorgabe `CONNECT_DEVICE_NAME` = `Raumthermometer` |
+| `remote` | IP-Adresse des Außensensors, leer = keiner (wird noch nicht abgefragt) |
+| `skip` | 1 = Konfigurationsmodus beim Start nicht automatisch öffnen |
+
+### Der Gerätename
+
+Mit mehreren Einheiten im Haus bekommt jede einen eigenen Namen. Er steht
+
+* im Browser (Seitenüberschrift und `<title>`),
+* im JSON als Feld `name`,
+* im seriellen Log (`device name "..."`),
+* **als DHCP-Hostname im Router** – daraus lässt sich das Gerät ohne
+  IP-Adresse erreichen.
+
+Dafür wird der Name auf Hostnamen-Zeichen reduziert: Kleinschreibung, Umlaute
+ausgeschrieben, alles andere wird zu `-`.
+
+| Name im Formular | Hostname | erreichbar als |
+|---|---|---|
+| `Raumthermometer` | `raumthermometer` | `http://raumthermometer.local/` |
+| `Thermometer Küche` | `thermometer-kueche` | `http://thermometer-kueche.local/` |
+
+Damit sind **zwei** Wege möglich, das Gerät ohne IP-Adresse zu erreichen:
+
+1. **`<hostname>.local`** – über mDNS, funktioniert in jedem Netz, ohne Zutun des
+   Routers (siehe [mDNS](#mdns-erreichbarkeit-ohne-router-dns-discoveryc))
+2. **`<hostname>.<domain-des-routers>`** – über das lokale DNS des Routers, z. B.
+   `thermometer-kueche.fritz.box`. Die Domain hängt vom Router ab (`fritz.box`,
+   `lan`, `speedport.ip`, bei manchen gar keine) und steht am PC in
+   `ipconfig /all` als „Verbindungsspezifisches DNS-Suffix“.
+
+Nach dem Ändern des Namens einmal neu starten, dann ist er neu angemeldet.
+
+```c
+netcfg_t cfg;
+if (netcfg_load(&cfg)) { … }   /* false = noch nichts gespeichert, connect.h gilt */
+```
+
+Den Modus erzwingen (zum Testen von Hotspot und Seite):
+
+```c
+#define APP_FORCE_CONFIG 1   /* main/main.c, danach zurück auf 0 */
+```
+
+**Achtung:** solange der Schalter auf 1 steht, versucht das Gerät *nie* eine
+Verbindung – es landet nach jedem Start wieder in der Einrichtung. Der Build
+warnt dann (`#warning "APP_FORCE_CONFIG is 1 ..."`), und im Log steht eine
+`E`-Zeile mit `!! APP_FORCE_CONFIG is 1 !!`.
+
+### Die Seite selbst
+
+Der HTTP-Server (`esp_http_server`) läuft auf Port 80 mit drei Sockets und 6 KB
+Task-Stack; die Seite wird pro Anfrage in einem 6-KB-Heap-Puffer zusammengesetzt
+und danach wieder freigegeben. **Port 80 ist auch der Messwert-Endpunkt** –
+deshalb stoppt der Konfigurationsmodus ihn zuerst (`webserver_stop()`, Logzeile
+`readings endpoint stopped`). Sonst würde `http://192.168.4.1` weiterhin die
+Messwertseite zeigen, weil beide Server auf demselben Port lauschen. Der Access Point läuft im Modus **APSTA**: die
+Station-Schnittstelle ist zwar nicht verbunden, wird aber für den Scan gebraucht.
+Gescannt wird beim Start des Modus; „neu suchen“ scannt erneut.
+
 ## WLAN, Uhrzeit und Sonnenzeiten – [main/connect.h](main/connect.h), [main/wifi.c](main/wifi.c), [main/clock.c](main/clock.c), [main/sun.c](main/sun.c)
 
 Alles, was zur Installation gehört, steht in **`main/connect.h`**: SSID, Passwort,
-Hostname, NTP-Server, Zeitzone und die Koordinaten für sunrise-sunset.org.
+Hostname, NTP-Server, Zeitzone und die Koordinaten für sunrise-sunset.org – als
+Vorgaben, änderbar über die Konfigurationsseite (siehe oben).
 
 ```c
 #define CONNECT_WIFI_SSID       "FRITZ!Box 7590 j.oe"
@@ -191,9 +328,11 @@ startet also sofort):
 
 1. `clock_init()` setzt die Zeitzone (`setenv("TZ", …)` + `tzset()`), damit
    `localtime_r()` Ortszeit liefert – inklusive Sommerzeit
-2. `wifi_connect()`: NVS, `esp_netif`, Event-Loop, Station-Modus, dann warten auf
-   die IP-Adresse. Nach einem Verbindungsabbruch wird neu verbunden; war das Gerät
-   schon einmal verbunden, endlos (Router-Neustart braucht keinen Geräte-Neustart)
+2. `wifi_init()` bringt den Treiber im Station-Modus hoch, `wifi_scan_rssi()`
+   prüft, ob das Netz überhaupt in Reichweite ist, dann `wifi_connect()` und
+   warten auf die IP-Adresse. Nach einem Verbindungsabbruch wird neu verbunden;
+   war das Gerät schon einmal verbunden, endlos (Router-Neustart braucht keinen
+   Geräte-Neustart)
 3. `clock_start_sntp()` + `clock_wait_for_sync()`: SNTP-Polling, ohne die Anzeige
    zu blockieren
 4. `sun_fetch()` holt Sonnenauf-/-untergang, danach alle
@@ -204,26 +343,27 @@ startet also sofort):
 
 ### Woher die Sonnenzeiten kommen
 
-Der Dateninput besteht aus **zwei Zahlen in `connect.h`** und einer daraus
-gebauten Adresse:
+Der Dateninput sind **zwei Koordinaten**: die im NVS gespeicherten, sonst die
+Vorgaben in `connect.h`. Daraus baut `netcfg_sun_url()` die Adresse:
 
 ```c
 #define CONNECT_LATITUDE_TEXT   "48.41490736914154"   /* Breite, Nord positiv, Süd negativ */
 #define CONNECT_LONGITUDE_TEXT  "11.099721982616911"  /* Länge, Ost positiv, West negativ */
-#define CONNECT_SUN_API_URL \
-    "https://api.sunrise-sunset.org/json?lat=" CONNECT_LATITUDE_TEXT \
-    "&lng=" CONNECT_LONGITUDE_TEXT "&formatted=0"
+
+netcfg_sun_url(url, sizeof(url));
+/* -> https://api.sunrise-sunset.org/json?lat=…&lng=…&formatted=0 */
 ```
 
-Für einen anderen Aufstellort also nur die beiden Textwerte ändern (Dezimalgrad
-mit Punkt, z. B. `"53.5511"` / `"9.9937"` für Hamburg) – URL und Abfrage folgen
-automatisch. Werte mit zu vielen Nachkommastellen sind unkritisch, die API
-rundet selbst.
+Für einen anderen Aufstellort also nur die beiden Werte ändern – am einfachsten
+auf der Konfigurationsseite (dort stehen sie im Formular), sonst als Vorgabe in
+`connect.h`. Dezimalgrad mit Punkt, z. B. `"53.5511"` / `"9.9937"` für Hamburg;
+URL und Abfrage folgen automatisch. Werte mit zu vielen Nachkommastellen sind
+unkritisch, die API rundet selbst.
 
 Der Ablauf in [sun.c](main/sun.c):
 
-1. HTTPS-GET auf `CONNECT_SUN_API_URL` (`esp_http_client`, Zertifikatsprüfung
-   gegen das CA-Bundle im Flash)
+1. HTTPS-GET auf die von `netcfg_sun_url()` gebaute Adresse
+   (`esp_http_client`, Zertifikatsprüfung gegen das CA-Bundle im Flash)
 2. Antwort ist JSON, daraus werden `status` und die beiden Felder `sunrise` und
    `sunset` gelesen, z. B. `"sunrise":"2026-10-18T05:38:23+00:00"` (UTC)
 3. Umrechnung UTC → Ortszeit über `localtime_r()`, also inklusive Sommerzeit
@@ -259,6 +399,134 @@ Zertifikatskette kommt als ein TLS-Record und passt nicht in 4 KB.
 Die TLS-Sitzung braucht während der Abfrage etwa 25–30 KB Heap; danach ist der
 Speicher wieder frei (die Anzeige läuft während der Abfrage weiter, weil sie in
 der Thermometer-Task läuft).
+
+## Messwerte über HTTP abrufen ? [main/webserver.c](main/webserver.c)
+
+Sobald das Gerät im Heimnetz angemeldet ist, läuft ein kleiner HTTP-Server auf
+Port 80. Er greift auf denselben Messwertspeicher zu, den die Anzeige f?llt
+([main/sensor.c](main/sensor.c) h?lt den letzten Satz mit Zeitstempel), also
+kostet eine Abfrage weder I2C-Zeit noch einen Bild-Neuaufbau.
+
+| Adresse | Inhalt |
+|---|---|
+| `GET /api/values` | JSON, gedacht für andere Geräte und Skripte |
+| `GET /api` | dasselbe (kurze Form) |
+| `GET /` | kleine Seite f?r den Browser, aktualisiert sich alle 10 s |
+
+```json
+{"valid":true,"temperature_c":23.3,"humidity_rh":48.0,"pressure_hpa":970.0,
+ "age_s":9,"time":"18.10. 22:21","ip":"192.168.123.122","rssi_dbm":-43,"uptime_s":14}
+```
+
+| Feld | Bedeutung |
+|---|---|
+| `name` | Gerätename aus der Einrichtung (Vorgabe `Raumthermometer`) |
+| `valid` | `false` = noch kein Messwert (Sensor fehlt oder Boot gerade erst) ? dann sind die drei Zahlen `null` |
+| `temperature_c`, `humidity_rh`, `pressure_hpa` | Zahlen mit **Punkt** als Dezimaltrennzeichen (JSON) und einer Nachkommastelle |
+| `age_s` | Alter des Messwerts in Sekunden (die Anzeige liest alle 10 s) |
+| `time` | Ortszeit `dd.mm. hh:mm`; vor der NTP-Antwort der R?ckfallwert `01.01. 00:00` |
+| `ip`, `rssi_dbm`, `uptime_s` | Adresse, Funkfeldst?rke, Laufzeit seit dem Start |
+| `remote` | eingestellte Adresse des Außensensors, `""` = keine |
+
+Die IP-Adresse steht im Log (`webserver: readings at http://?/api/values`) und
+auf der Seite selbst; im Router heißt das Gerät `raumthermometer`
+(`CONNECT_HOSTNAME`).
+
+### Am PC testen
+
+Am einfachsten über den Namen (siehe [Der Gerätename](#der-gerätename)) – dann
+muss man die IP nicht kennen. Mit `.local` geht es in jedem Netz:
+
+```
+http://thermometer-kueche.local/
+http://thermometer-kueche.local/api/values
+```
+
+Im Heimnetz der FRITZ!Box funktioniert genauso der dort angemeldete Name:
+
+```
+http://thermometer-kueche.fritz.box/api/values
+```
+
+**Browser:** die Adresse oben ohne Pfad – zeigt die Werte groß, die
+JSON-Adresse steht darunter als Hinweis.
+
+**PowerShell** (in diesem Windows ist `curl` ein Alias auf `Invoke-WebRequest`,
+deshalb `curl.exe`):
+
+```powershell
+curl.exe -s http://thermometer-kueche.local/api/values
+curl.exe -s -i http://thermometer-kueche.fritz.box/api/values   # mit HTTP-Kopfzeilen
+Invoke-RestMethod http://thermometer-kueche.fritz.box/api/values # direkt als Objekt
+```
+
+Statt des Namens geht auch die IP aus dem Log (`ip` im JSON, `webserver: readings
+at http://…`).
+
+**Eingabeaufforderung (cmd.exe):**
+
+```bat
+curl http://thermometer-kueche.fritz.box/api/values
+```
+
+**Nur ein Feld herausziehen**, z. B. f?r ein Skript:
+
+```powershell
+(Invoke-RestMethod http://thermometer-kueche.fritz.box/api/values).temperature_c
+curl.exe -s http://thermometer-kueche.fritz.box/api/values | python -c "import json,sys; print(json.load(sys.stdin)['pressure_hpa'])"
+```
+
+**Dauerhaft mitschreiben** (eine Zeile pro 10 s, bis Strg+C):
+
+```powershell
+while ($true) { curl.exe -s http://thermometer-kueche.fritz.box/api/values; Write-Output ''; Start-Sleep 10 }
+```
+
+Kleine Stolperfallen: `http://` nicht vergessen, das Gerät antwortet nur im
+selben Netz (kein Portforwarding). Der Name im Router bleibt stabil, auch wenn sich
+die IP per DHCP ändert – deshalb in Skripten lieber den Namen verwenden. Klappt die
+Namensauflösung nicht (anderer Router, Gästenetz), im Router nachsehen, unter
+welcher IP und welchem Namen `thermometer-kueche` steht.
+
+## mDNS: Erreichbarkeit ohne Router-DNS – [main/discovery.c](main/discovery.c)
+
+Die DHCP-Adresse und der Hostname helfen nur, wenn der Router lokale Namen
+auflöst und der Client dessen Domain benutzt. Damit das Gerät **in jedem Netz**
+unter seinem Namen erreichbar ist, läuft ein mDNS-Responder
+(Komponente `espressif/mdns`):
+
+```
+http://thermometer-kueche.local/
+http://thermometer-kueche.local/api/values
+```
+
+Das funktioniert ohne Router-Konfiguration, auch im Gästenetz und hinter einem
+Repeater mit anderem Namen. Zusätzlich wird der HTTP-Dienst als `_http._tcp`
+angemeldet – damit taucht die Unit in Netzwerk-Scannern und in der
+Netzwerkansicht von Windows/macOS auf.
+
+| Punkt | Wert |
+|---|---|
+| Hostname | aus dem Gerätenamen, `netcfg_hostname()` (identisch zum DHCP-Namen) |
+| Instanzname | der Gerätename selbst, darf Leerzeichen und Umlaute enthalten |
+| Dienst | `_http._tcp` auf Port 80 |
+| Speicher | gemessen 5,5 KB Heap (115396 → 109936 Bytes), größter Block − 6 KB |
+| Start | nach `webserver_start()` in der Netzwerk-Task |
+| Ende | `discovery_stop()` beim Eintritt in den Konfigurationsmodus |
+
+```c
+discovery_start();   /* main/main.c, nach erfolgreicher Anmeldung */
+discovery_stop();    /* main/configmode.c, vor dem Access Point */
+```
+
+Der Modulname ist `discovery` und nicht `mdns`, weil ein `main/mdns.h` den Header
+der mDNS-Komponente verdecken würde – dieselbe Falle wie bei `main/time.h`
+(siehe [clock.h](main/clock.h)).
+
+**Wer `.local` nicht auflösen kann:** Windows 10/11 und macOS können es von
+Haus aus, unter Android erst ab Version 12 (davor hilft z. B. die App
+„Bonjour Browser“ oder die IP-Adresse). In solchen Fällen bleibt der Weg über
+den Router-Hostnamen oder direkt die IP aus dem JSON-Feld `ip`.
 
 ## Hardware
 
@@ -644,6 +912,11 @@ einer 3008-KB-Partition, Flash 4 MB, CPU 240 MHz).
 | [main/stb_truetype.h](main/stb_truetype.h) | TrueType-Rasterizer (public domain), mit einer lokalen Anpassung: kleinere Heap-Chunks (siehe oben) |
 | [main/testscreen.c](main/testscreen.c), [main/testscreen.h](main/testscreen.h) | Hardware-Testbild, Statuszeile, Touch-Punkte, BOOT-Neudruck (separat entfernbar) |
 | [main/statusled.c](main/statusled.c), [main/statusled.h](main/statusled.h) | RGB-LED über LEDC-PWM: Selbsttest, Regenbogen-Ambilight bei Nacht, sonst gedimmtes Weiß |
+| [main/configmode.c](main/configmode.c), [main/configmode.h](main/configmode.h) | WLAN-Konfiguration: Access Point, HTTP-Server mit Einrichtungsseite, TFT-Hinweis, Zurück-Schaltfläche |
+| [main/netcfg.c](main/netcfg.c), [main/netcfg.h](main/netcfg.h) | WLAN-Daten und Koordinaten im NVS: laden, speichern, `netcfg_sun_url()` |
+| [main/webserver.c](main/webserver.c), [main/webserver.h](main/webserver.h) | Dauerhafter HTTP-Server im Heimnetz: `GET /api/values` (JSON), `GET /` (Browserseite) |
+| [main/discovery.c](main/discovery.c), [main/discovery.h](main/discovery.h) | mDNS: `<hostname>.local` und `_http._tcp`, in jedem Netz ohne Router-DNS |
+| [main/textutil.c](main/textutil.c), [main/textutil.h](main/textutil.h) | Maskierung für HTML und JSON (Konfigurationsseite, Messwert-Endpunkt) |
 | [main/gfx.c](main/gfx.c), [main/gfx.h](main/gfx.h) | Mini-Grafikbibliothek: Canvas (auch als Band), Rechtecke, Linien, Kreis, Text, Flush |
 | [main/gfx_color.h](main/gfx_color.h) | RGB565-Farbmakros, ohne ESP-IDF-Abhängigkeit (auch für Datentabellen nutzbar) |
 | [main/font5x7.c](main/font5x7.c), [main/font5x7.h](main/font5x7.h) | 5×7-Pixel-Font (A–Z, 0–9, Satzzeichen), generiert |
@@ -652,9 +925,9 @@ einer 3008-KB-Partition, Flash 4 MB, CPU 240 MHz).
 | [main/sensor.c](main/sensor.c), [main/sensor.h](main/sensor.h) | BME280: I²C-Bus, Sensor-Init, Temperatur/Feuchte/Druck |
 | [main/background.h](main/background.h) | Tabelle der 48 Wallpaper-Dateinamen und Textfarben je Jahreszeit/Tageszeit |
 | [data/](data) | Inhalt der littlefs-Partition (Wallpaper), wird beim Bauen zum Image |
-| [main/idf_component.yml](main/idf_component.yml) | Abhängigkeiten aus der Component Registry |
+| [main/idf_component.yml](main/idf_component.yml) | Abhängigkeiten aus der Component Registry (LCD, Touch, littlefs, BME280, mDNS) |
 | [tools/gen_font5x7.py](tools/gen_font5x7.py) | Erzeugt den Font neu (Glyphen als ASCII-Art, mit Probedruck) |
-| [sdkconfig.defaults](sdkconfig.defaults) | 4 MB Flash, 240 MHz CPU, Ziel esp32, eigene Partitionstabelle, littlefs-Namenslänge 128, Z-Druckschwelle des Touch-Treibers, WiFi-Puffer (RAM), TLS-Optionen für HTTPS |
+| [sdkconfig.defaults](sdkconfig.defaults) | 4 MB Flash, 240 MHz CPU, Ziel esp32, eigene Partitionstabelle, littlefs-Namenslänge 128, Z-Druckschwelle des Touch-Treibers, WiFi-Puffer (RAM), SoftAP für den Konfigurationsmodus, TLS-Optionen für HTTPS |
 | [partitions.csv](partitions.csv) | Partitionstabelle: nvs, phy_init, 3 MB App, 1 MB littlefs |
 | [idf.cmd](idf.cmd) | Wrapper: `.\idf build` / `.\idf -p COM8 flash monitor` ohne ESP-IDF-Profil |
 
@@ -747,8 +1020,19 @@ weiter.
 | Bild um 90° verdreht | `BOARD_LCD_LANDSCAPE` auf `0` setzen (Hochformat) |
 | Streifen, Flackern, Farbrauschen | `BOARD_LCD_PIXEL_CLOCK_HZ` auf `20 * 1000 * 1000` reduzieren |
 | `not enough memory for the 240x160 band canvas` | Heap-Optionen/BT abgeschaltet lassen; ein Band braucht 77 KB. Bleibt es knapp: `LAYOUT_BAND_HEIGHT` in [layout.h](main/layout.h) halbieren (80 Zeilen = 38 KB, dafür vier Decoder-Durchläufe) |
-| `cannot reach "…" (reason 201 …)` im Log | Access Point nicht gefunden: SSID in [connect.h](main/connect.h) prüfen (Groß-/Kleinschreibung, 2,4 GHz – der ESP32 kann kein 5-GHz-Band), Gerät weiter vom Router entfernt |
-| `reason 15` beim Verbinden | Passwort falsch: `CONNECT_WIFI_PASSWORD` in [connect.h](main/connect.h) prüfen |
+| `cannot reach "…" (reason 201 …)` im Log | Access Point nicht gefunden: SSID prüfen (Groß-/Kleinschreibung, 2,4 GHz – der ESP32 kann kein 5-GHz-Band), Gerät weiter vom Router entfernt. Alternativ im Eck-Touch den Konfigurationsmodus öffnen |
+| `reason 15` beim Verbinden | Passwort falsch. Am einfachsten neu eingeben: Eck-Touch (x 180…239, y 0…59, 500 ms halten) oder `APP_FORCE_CONFIG 1` in [main.c](main/main.c) |
+| Gerät hängt in der Einrichtungsschleife | Es kommt nach dem Speichern immer wieder zum Setup-Bildschirm: SSID/Passwort im Formular falsch, oder ein Testbuild mit `APP_FORCE_CONFIG 1` ist geflasht (dann wird das Netz nie versucht) – Logzeile `WLAN "…" from NVS` und `found with … dBm` prüfen |
+| Gleiche SSID mehrfach in der Liste | Sollte nicht mehr auftreten (Mesh und 2,4/5 GHz werden zusammengefasst, der stärkere Eintrag bleibt). Sonst im Log `wifi: scan: … networks, … shown` ansehen |
+| Hotspot `thermometer` erscheint nicht | Der Konfigurationsmodus läuft nicht (kein Netzproblem, `skip` gesetzt). Eck-Touch halten oder `APP_FORCE_CONFIG 1` setzen. `CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y` muss in der `sdkconfig` stehen – nach Änderungen an [sdkconfig.defaults](sdkconfig.defaults) die `sdkconfig` löschen und neu bauen |
+| Seite `192.168.4.1` lädt nicht | Mit dem Hotspot verbinden (nicht mit dem Heimnetz), Passwort `CONNECT_AP_PASSWORD`. Am TFT steht die tatsächliche Adresse; `configmode: web server at http://…` im Log prüfen |
+| Speichern quittiert mit 400 | Meldung auf der Seite lesen: Passwort 1–7 Zeichen (WPA2 braucht mindestens 8), SSID leer/zu lang, oder Koordinaten außerhalb −90…90 bzw. −180…180 |
+| Nach „Speichern“ passiert nichts | Das Gerät startet nach 1,5 s neu (`configmode: restarting with the new settings`); die Seite verliert dabei die Verbindung. Am TFT erscheint wieder die Anzeige |
+| `http://?/api/values` antwortet nicht | Der Endpunkt läuft erst nach erfolgreicher Anmeldung im Heimnetz (`webserver: readings at ?` im Log). IP prüfen, Port 80 nicht von einer Firewall blockiert, Gerät und PC im selben Netz |
+| `<hostname>.local` wird nicht aufgelöst | mDNS fehlt beim Client: unter Windows beide Dienste prüfen (`Dnscache`/`fdPHost`), unter Android erst ab Version 12 vorhanden, manche Firmennetze blockieren Multicast. Im Log steht `discovery: announced as http://….local/`; sonst Router-Hostname oder IP nutzen |
+| `192.168.4.1` zeigt die Messwertseite statt der Einrichtung | War ein Fehler: Messwert- und Einrichtungs-Server lauschten beide auf Port 80. Behoben durch `webserver_stop()` beim Eintritt in den Konfigurationsmodus – im Log muss `readings endpoint stopped` vor `access point` stehen |
+| `Nothing matches the given URI` | Pfad falsch: genau `/api/values`, `/api` oder `/`. Der Server im Konfigurationsmodus kennt diese Pfade nicht |
+| JSON zeigt `"valid":false` und `null` | Noch kein Messwert im Speicher: Sensor fehlt (`no BME280 at 0x76` im Log) oder die Abfrage kam vor dem ersten Frame |
 | `connect.h: No such file or directory` | [connect.h](main/connect.h) fehlt, weil sie nicht im Repository liegt: `Copy-Item main\connect.example.h main\connect.h` und Werte eintragen |
 | Uhrzeit bleibt `01.01. 00:00` | Platzhalter aus [main.c](main/main.c): kein WLAN, kein NTP-Antwort innerhalb `CONNECT_SNTP_WAIT_MS`, oder Port 123/UDP von der Firewall blockiert. Testweise anderen Server in `CONNECT_SNTP_SERVER` eintragen (`pool.ntp.org`) |
 | `sun: request failed: ESP_ERR_HTTP_CONNECT` mit `No matching trusted root certificate found` | `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y` fehlt (siehe [HTTPS und Zertifikate](#https-und-zertifikate)) |
@@ -840,11 +1124,18 @@ Abhängigkeiten selbst nach. `sdkconfig.defaults` wirkt nur bei neu erzeugter
     09:00 bzw. 10:00 im Winter, Sonnenuntergang, 23:00) und
     `wallpaper_season_from_month()`; beim Slot-Wechsel wird eines der drei Bilder
     zufällig gewählt. Regeln und Zeiten stehen als `WALLPAPER_*` in
-    [main/wallpaper.h](main/wallpaper.h) –    die Sonnenzeiten können dabei die Grenze zwischen Tag und Nacht genauer ziehen
+    [main/wallpaper.h](main/wallpaper.h) – die Sonnenzeiten können dabei die Grenze zwischen Tag und Nacht genauer ziehen
     als feste Stunden
-11. HTTP-Server mit JSON-Endpunkt für Temperatur/Luftfeuchte
-12. Feinschliff: nur das betroffene Band neu zeichnen statt beider (das
-    JPEG-Dekodieren von ~110 ms pro Band bliebe allerdings)
+11. ~~WLAN am Gerät einrichten~~ – erledigt: Access Point `thermometer`, Seite unter
+    `http://192.168.4.1`, Ablage im NVS ([main/configmode.c](main/configmode.c),
+    [main/netcfg.c](main/netcfg.c))
+12. ~~HTTP-Endpunkt mit JSON~~ – erledigt: `GET /api/values` über
+    [main/webserver.c](main/webserver.c), gespeist aus dem Messwertspeicher in
+    [main/sensor.c](main/sensor.c)
+14. Außentemperatursensor abfragen: das Feld für seine IP-Adresse steht
+    bereits im Einrichtungsdialog und im NVS (`remote`). Fehlt noch: eine Schleife im
+    Netzwerkteil, die `http://<remote>/api/values` liest, und eine Einblendung in der
+    Mitte der Anzeige bei Touch dortselbst
 
 Optional, nicht für das Raumthermometer nötig:
 

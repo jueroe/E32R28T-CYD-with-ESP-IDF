@@ -6,8 +6,8 @@
  * time.h would shadow the C library header <time.h> - the compiler then no
  * longer knows time_t, struct tm, time() or localtime_r().
  *
- * The sun times are still placeholders; fetching them from
- * sunrise-sunset.org (CONNECT_SUN_API_URL) comes with the HTTP client step.
+ * The sun times are read from sunrise-sunset.org (see sun.c), the coordinates
+ * come from netcfg.h (NVS, or connect.h as defaults).
  */
 
 #pragma once

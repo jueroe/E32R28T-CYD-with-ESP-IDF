@@ -37,10 +37,13 @@
 #include "bigdigit.h"
 #include "board_e32r28t.h"
 #include "clock.h"
+#include "configmode.h"
 #include "connect.h"
+#include "discovery.h"
 #include "gfx.h"
 #include "infotile.h"
 #include "layout.h"
+#include "netcfg.h"
 #include "sensor.h"
 #include "statusled.h"
 #include "storage.h"
@@ -49,6 +52,7 @@
 #include "touch.h"
 #include "ttf.h"
 #include "wallpaper.h"
+#include "webserver.h"
 #include "wifi.h"
 
 static const char *TAG = "cyd";
@@ -56,9 +60,28 @@ static const char *TAG = "cyd";
 /* 1 = hardware test screen instead of the thermometer readout */
 #define APP_SHOW_TESTSCREEN 0
 
+/* 1 = go straight to the WLAN configuration mode after boot, without waiting
+ * for a network problem and without touching the corner (for testing the
+ * access point and the web page).  While this is 1 the device NEVER connects -
+ * do not leave it on. */
+#define APP_FORCE_CONFIG 0
+
+#if APP_FORCE_CONFIG
+#warning "APP_FORCE_CONFIG is 1: this build always starts the WLAN configuration"
+#endif
+
+/* TEST ONLY: seconds after the network came up to jump into the configuration
+ * mode, or 0 for normal operation.  Used to check that the configuration server
+ * really takes over port 80 from the readings endpoint. */
+#define APP_TEST_CONFIG_AFTER_CONNECT_S 0
+
 /* The wallpaper slot now follows season and time of day, see wallpaper.h.
  * Seconds between sensor reads (a thermometer does not need more) */
 #define SENSOR_INTERVAL_S 10
+
+/* The display task wakes up this often to look for a touch in the corner of the
+ * readout (configuration mode).  Sensor and background keep their 10 s cycle. */
+#define APP_TICK_MS 100
 
 /* Shown in the info tile as long as the NTP clock has no time yet: 01.01. 00:00
  * (the year is not part of the line, the tile shows dd.mm. hh:mm) */
@@ -383,7 +406,17 @@ static void thermometer_task(void)
     }
 
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_S * 1000));
+        /* Short steps so that a touch in the corner starts the configuration
+         * mode immediately; the values themselves keep the 10 s cycle. */
+        bool enter_config = false;
+        for (int tick = 0; tick < SENSOR_INTERVAL_S * (1000 / APP_TICK_MS) && !enter_config;
+             tick++) {
+            vTaskDelay(pdMS_TO_TICKS(APP_TICK_MS));
+            enter_config = configmode_requested() || configmode_corner_touched();
+        }
+        if (enter_config) {
+            configmode_run(&s_canvas, s_panel); /* never returns, restarts the device */
+        }
 
         /* the clock runs on its own, so refresh it even when the sensor fails;
          * a new background has to be drawn in any case */
@@ -435,12 +468,65 @@ static void network_task(void *argument)
 {
     (void)argument;
 
-    if (!wifi_connect(CONNECT_WIFI_TIMEOUT_MS)) {
-        ESP_LOGW(TAG, "no network - date and time keep the fallback values");
+    netcfg_t cfg;
+    const bool stored = netcfg_load(&cfg);
+    ESP_LOGI(TAG, "WLAN \"%s\" from %s", cfg.ssid, stored ? "NVS" : "connect.h");
+    ESP_LOGI(TAG, "device name \"%s\", outdoor sensor %s", cfg.name,
+             cfg.remote[0] != '\0' ? cfg.remote : "not set");
+
+    if (wifi_init() != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi driver did not come up, continuing without network");
         vTaskDelete(NULL);
         return;
     }
+
+    /* Look for the network first: when it is not there, the connection attempt
+     * would only cost the full timeout before the configuration starts. */
+    bool connected = false;
+    const int rssi = wifi_scan_rssi(cfg.ssid);
+    if (rssi == WIFI_RSSI_NOT_FOUND) {
+        ESP_LOGW(TAG, "\"%s\" is not in the scan result", cfg.ssid);
+    } else if (rssi < CONNECT_MIN_RSSI) {
+        ESP_LOGW(TAG, "\"%s\" is too weak: %d dBm, at least %d dBm needed", cfg.ssid, rssi,
+                 CONNECT_MIN_RSSI);
+    } else {
+        ESP_LOGI(TAG, "\"%s\" found with %d dBm", cfg.ssid, rssi);
+        connected = wifi_connect(cfg.ssid, cfg.password, CONNECT_WIFI_TIMEOUT_MS);
+    }
+
+    if (!connected) {
+        if (netcfg_skipped()) {
+            ESP_LOGW(TAG, "no network - the readout runs without time and sun times");
+        } else {
+            ESP_LOGW(TAG, "no network - opening the WLAN configuration");
+            configmode_request();
+        }
+        vTaskDelete(NULL);
+        return;
+    }
+
     wifi_log_link();
+
+    /* the readings endpoint comes up before the time is known: it reports the
+     * fallback date until NTP answered */
+    if (webserver_start() != ESP_OK) {
+        ESP_LOGW(TAG, "the readings endpoint is not available");
+    }
+
+    /* announce <name>.local, so the unit is reachable without knowing the IP or
+     * the router's domain */
+    if (discovery_start() != ESP_OK) {
+        ESP_LOGW(TAG, "the unit is not announced via mDNS");
+    }
+
+#if APP_TEST_CONFIG_AFTER_CONNECT_S > 0
+    /* TEST ONLY: enter the configuration mode while the readings endpoint is
+     * running, to check that it takes over port 80.  Set the macro to 0 when
+     * done (see the top of this file). */
+    vTaskDelay(pdMS_TO_TICKS(APP_TEST_CONFIG_AFTER_CONNECT_S * 1000));
+    ESP_LOGW(TAG, "TEST: opening the WLAN configuration while the endpoint runs");
+    configmode_request();
+#endif
     clock_start_sntp();
     if (!clock_wait_for_sync(CONNECT_SNTP_WAIT_MS)) {
         /* the first query can get lost on a busy network; without a retry the
@@ -471,6 +557,12 @@ void app_main(void)
     ESP_LOGI(TAG, "heap: %d bytes free, largest free block %d bytes",
              (int)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
              (int)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+
+    /* NVS holds the WLAN data and the location, so it has to be up before the
+     * network task and the configuration mode run */
+    if (netcfg_init() != ESP_OK) {
+        ESP_LOGW(TAG, "NVS not available - the WLAN cannot be configured on the device");
+    }
 
     backlight_init();
     backlight_set(0);
@@ -511,9 +603,15 @@ void app_main(void)
     /* Time zone first: the clock shows the local time as soon as NTP answers */
     clock_init();
 
+#if APP_FORCE_CONFIG
+    ESP_LOGE(TAG, "!! APP_FORCE_CONFIG is 1: always starting the WLAN configuration, "
+                  "no connection attempt !!");
+    configmode_request();
+#else
     if (xTaskCreate(network_task, "network", 8192, NULL, 5, NULL) != pdPASS) {
         ESP_LOGW(TAG, "no memory for the network task - no WiFi and no NTP");
     }
+#endif
 
     ESP_LOGI(TAG, "%d free heap bytes after initialisation", (int)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
 

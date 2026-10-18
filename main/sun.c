@@ -12,6 +12,7 @@
 
 #include "clock.h"
 #include "connect.h"
+#include "netcfg.h"
 
 static const char *TAG = "sun";
 
@@ -175,7 +176,10 @@ esp_err_t sun_fetch(void)
         return ESP_ERR_NO_MEM;
     }
 
-    esp_err_t err = http_get(CONNECT_SUN_API_URL, body, SUN_RESPONSE_SIZE);
+    char url[160];
+    netcfg_sun_url(url, sizeof(url));
+
+    esp_err_t err = http_get(url, body, SUN_RESPONSE_SIZE);
     if (err == ESP_OK) {
         char status[16];
         if (!json_string(body, "status", status, sizeof(status)) || strcmp(status, "OK") != 0) {

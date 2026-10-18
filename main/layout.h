@@ -81,3 +81,44 @@
 
 /* Strongest horizontal squeeze per line; 1.0 = never condense */
 #define LAYOUT_INFO_MIN_SQUEEZE     0.6f
+
+/* ------------------------------------------------------------------------- */
+/* WLAN configuration screen                                                 */
+/* ------------------------------------------------------------------------- */
+
+/* Touch in this rectangle (upper right corner of the readout) opens the
+ * configuration screen.  The finger has to stay there for LAYOUT_CONFIG_HOLD_MS
+ * so that brushing the corner does not switch the mode by accident. */
+#define LAYOUT_CONFIG_TRIGGER_X     180
+#define LAYOUT_CONFIG_TRIGGER_Y     0
+#define LAYOUT_CONFIG_TRIGGER_W     60
+#define LAYOUT_CONFIG_TRIGGER_H     60
+#define LAYOUT_CONFIG_HOLD_MS       500
+
+/* Back button across the whole lower edge */
+#define LAYOUT_CONFIG_BACK_Y        264
+#define LAYOUT_CONFIG_BACK_H        56
+
+/* Text column of the configuration screen */
+#define LAYOUT_CONFIG_TEXT_X        16
+#define LAYOUT_CONFIG_TEXT_W        208
+
+/* Cap heights */
+#define LAYOUT_CONFIG_TITLE_CAP     22
+#define LAYOUT_CONFIG_STATUS_CAP    12
+#define LAYOUT_CONFIG_LABEL_CAP     14
+#define LAYOUT_CONFIG_VALUE_CAP     26
+#define LAYOUT_CONFIG_HINT_CAP      13
+#define LAYOUT_CONFIG_BUTTON_CAP    18
+
+/* Baselines (the baseline is the bottom edge of the capital letters) */
+#define LAYOUT_CONFIG_TITLE_Y       40
+#define LAYOUT_CONFIG_STATUS_Y      60
+#define LAYOUT_CONFIG_LINE1_Y       70
+#define LAYOUT_CONFIG_ROW1_LABEL_Y  96
+#define LAYOUT_CONFIG_ROW1_VALUE_Y  132
+#define LAYOUT_CONFIG_ROW1_HINT_Y   152
+#define LAYOUT_CONFIG_LINE2_Y       166
+#define LAYOUT_CONFIG_ROW2_LABEL_Y  192
+#define LAYOUT_CONFIG_ROW2_VALUE_Y  228
+#define LAYOUT_CONFIG_BUTTON_TEXT_Y 300
