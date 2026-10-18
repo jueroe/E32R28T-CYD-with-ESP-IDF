@@ -1,4 +1,4 @@
-#include "gfx.h"
+﻿#include "gfx.h"
 
 #include <string.h>
 
@@ -14,13 +14,14 @@ esp_err_t gfx_canvas_init(gfx_canvas_t *canvas, int width, int height)
     memset(canvas, 0, sizeof(*canvas));
 
     const size_t pixels_size = (size_t)width * height * sizeof(uint16_t);
-    const size_t scratch_size = (size_t)width * GFX_FLUSH_BAND_LINES * sizeof(uint16_t);
 
+    /* The bounce buffer is only needed for partial flushes, so it is allocated
+     * on first use - a full frame reads straight from the pixel memory and the
+     * 11 KB of RAM stay with the network stack. */
     canvas->pixels = heap_caps_malloc(pixels_size, MALLOC_CAP_DMA);
-    canvas->scratch = heap_caps_malloc(scratch_size, MALLOC_CAP_DMA);
-    if (canvas->pixels == NULL || canvas->scratch == NULL) {
-        ESP_LOGE(TAG, "out of memory: %d x %d needs %u + %u bytes (largest free DMA block: %u bytes)",
-                 width, height, (unsigned)pixels_size, (unsigned)scratch_size,
+    if (canvas->pixels == NULL) {
+        ESP_LOGE(TAG, "out of memory: %d x %d needs %u bytes (largest free DMA block: %u bytes)",
+                 width, height, (unsigned)pixels_size,
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
         gfx_canvas_free(canvas);
         return ESP_ERR_NO_MEM;
@@ -28,8 +29,8 @@ esp_err_t gfx_canvas_init(gfx_canvas_t *canvas, int width, int height)
 
     canvas->width = width;
     canvas->height = height;
-    ESP_LOGI(TAG, "canvas %dx%d: framebuffer %u bytes, bounce buffer %u bytes",
-             width, height, (unsigned)pixels_size, (unsigned)scratch_size);
+    canvas->origin_y = 0;
+    ESP_LOGI(TAG, "canvas %dx%d: %u bytes", width, height, (unsigned)pixels_size);
     return ESP_OK;
 }
 
@@ -44,16 +45,50 @@ void gfx_canvas_free(gfx_canvas_t *canvas)
     memset(canvas, 0, sizeof(*canvas));
 }
 
+void gfx_canvas_set_origin(gfx_canvas_t *canvas, int origin_y)
+{
+    canvas->origin_y = origin_y;
+}
+
+bool gfx_canvas_is_first_band(const gfx_canvas_t *canvas)
+{
+    return canvas->origin_y == 0;
+}
+
+/* Clip screen rows to the part of the screen this canvas holds.  On success
+ * `y` and `height` are the local rows to write. */
+static bool clip_rows(const gfx_canvas_t *canvas, int *y, int *height)
+{
+    int first = *y - canvas->origin_y;
+    int last = first + *height;
+    if (first < 0) {
+        first = 0;
+    }
+    if (last > canvas->height) {
+        last = canvas->height;
+    }
+    if (first >= last) {
+        return false;
+    }
+    *y = first;
+    *height = last - first;
+    return true;
+}
+
 void gfx_pixel(gfx_canvas_t *canvas, int x, int y, uint16_t color)
 {
-    if ((unsigned)x < (unsigned)canvas->width && (unsigned)y < (unsigned)canvas->height) {
-        canvas->pixels[y * canvas->width + x] = color;
+    const int local_y = y - canvas->origin_y;
+    if ((unsigned)x < (unsigned)canvas->width && (unsigned)local_y < (unsigned)canvas->height) {
+        canvas->pixels[local_y * canvas->width + x] = color;
     }
 }
 
 void gfx_clear(gfx_canvas_t *canvas, uint16_t color)
 {
-    gfx_fill_rect(canvas, 0, 0, canvas->width, canvas->height, color);
+    const size_t count = (size_t)canvas->width * canvas->height;
+    for (size_t i = 0; i < count; i++) {
+        canvas->pixels[i] = color;
+    }
 }
 
 void gfx_fill_rect(gfx_canvas_t *canvas, int x, int y, int width, int height, uint16_t color)
@@ -62,15 +97,19 @@ void gfx_fill_rect(gfx_canvas_t *canvas, int x, int y, int width, int height, ui
         return;
     }
 
-    const int x0 = x > 0 ? x : 0;
-    const int y0 = y > 0 ? y : 0;
-    const int x1 = (x + width) < canvas->width ? (x + width) : canvas->width;
-    const int y1 = (y + height) < canvas->height ? (y + height) : canvas->height;
-    if (x0 >= x1 || y0 >= y1) {
+    int local_y = y;
+    int local_height = height;
+    if (!clip_rows(canvas, &local_y, &local_height)) {
         return;
     }
 
-    for (int row = y0; row < y1; row++) {
+    const int x0 = x > 0 ? x : 0;
+    const int x1 = (x + width) < canvas->width ? (x + width) : canvas->width;
+    if (x0 >= x1) {
+        return;
+    }
+
+    for (int row = local_y; row < local_y + local_height; row++) {
         uint16_t *dest = &canvas->pixels[row * canvas->width + x0];
         for (int i = x1 - x0; i > 0; i--) {
             *dest++ = color;
@@ -174,18 +213,15 @@ int gfx_text_width(const char *text, int scale)
     return (length * FONT5X7_ADVANCE - 1) * (scale < 1 ? 1 : scale);
 }
 
-/* Split a byte-swapped RGB565 value into 5/6/5 components. */
+/* Split a byte swapped RGB565 value into 5/6/5 components. */
 static inline void rgb565_unpack(uint16_t value, int *r, int *g, int *b)
 {
-    const uint16_t native = GFX_SWAP16(value);
-    *r = (native >> 11) & 0x1F;
-    *g = (native >> 5) & 0x3F;
-    *b = native & 0x1F;
+    gfx_unpack565(value, r, g, b);
 }
 
 static inline uint16_t rgb565_pack(int r, int g, int b)
 {
-    return GFX_SWAP16((uint16_t)((r << 11) | (g << 5) | b));
+    return gfx_pack565(r, g, b);
 }
 
 void gfx_blend_mask(gfx_canvas_t *canvas, int x, int y, int width, int height,
@@ -200,8 +236,10 @@ void gfx_blend_mask(gfx_canvas_t *canvas, int x, int y, int width, int height,
     int cb = 0;
     rgb565_unpack(color, &cr, &cg, &cb);
 
+    const int first_row = y - canvas->origin_y;
+
     for (int row = 0; row < height; row++) {
-        const int dest_y = y + row;
+        const int dest_y = first_row + row;
         if (dest_y < 0 || dest_y >= canvas->height) {
             continue;
         }
@@ -219,6 +257,7 @@ void gfx_blend_mask(gfx_canvas_t *canvas, int x, int y, int width, int height,
             }
             if (alpha == 255) {
                 dest_row[dest_x] = color;
+
                 continue;
             }
 
@@ -231,6 +270,7 @@ void gfx_blend_mask(gfx_canvas_t *canvas, int x, int y, int width, int height,
             g += (cg - g) * alpha / 255;
             b += (cb - b) * alpha / 255;
             dest_row[dest_x] = rgb565_pack(r, g, b);
+
         }
     }
 }
@@ -270,18 +310,31 @@ esp_err_t gfx_flush(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel,
                     int x, int y, int width, int height)
 {
     const int x0 = x > 0 ? x : 0;
-    const int y0 = y > 0 ? y : 0;
     const int x1 = (x + width) < canvas->width ? (x + width) : canvas->width;
-    const int y1 = (y + height) < canvas->height ? (y + height) : canvas->height;
-    if (x0 >= x1 || y0 >= y1) {
+
+    int local_y = y;
+    int local_height = height;
+    if (!clip_rows(canvas, &local_y, &local_height) || x0 >= x1) {
         return ESP_OK;
     }
+    const int local_y_end = local_y + local_height;
 
     const int line_pixels = x1 - x0;
     const bool full_width = (line_pixels == canvas->width);
 
-    for (int band_y = y0; band_y < y1; band_y += GFX_FLUSH_BAND_LINES) {
-        const int band_lines = (y1 - band_y) < GFX_FLUSH_BAND_LINES ? (y1 - band_y) : GFX_FLUSH_BAND_LINES;
+    if (!full_width && canvas->scratch == NULL) {
+        const size_t scratch_size = (size_t)canvas->width * GFX_FLUSH_BAND_LINES * sizeof(uint16_t);
+        canvas->scratch = heap_caps_malloc(scratch_size, MALLOC_CAP_DMA);
+        if (canvas->scratch == NULL) {
+            ESP_LOGE(TAG, "no memory for the %u byte bounce buffer", (unsigned)scratch_size);
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    for (int band_y = local_y; band_y < local_y_end; band_y += GFX_FLUSH_BAND_LINES) {
+        const int band_lines = (local_y_end - band_y) < GFX_FLUSH_BAND_LINES
+                                   ? (local_y_end - band_y)
+                                   : GFX_FLUSH_BAND_LINES;
         const uint16_t *source;
 
         if (full_width) {
@@ -297,10 +350,12 @@ esp_err_t gfx_flush(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel,
             source = canvas->scratch;
         }
 
-        const esp_err_t err = esp_lcd_panel_draw_bitmap(panel, x0, band_y, x1, band_y + band_lines, source);
+        const int screen_y = canvas->origin_y + band_y;
+        const esp_err_t err =
+            esp_lcd_panel_draw_bitmap(panel, x0, screen_y, x1, screen_y + band_lines, source);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "draw_bitmap(%d,%d)-(%d,%d) failed: %s", x0, band_y, x1, band_y + band_lines,
-                     esp_err_to_name(err));
+            ESP_LOGE(TAG, "draw_bitmap(%d,%d)-(%d,%d) failed: %s", x0, screen_y, x1,
+                     screen_y + band_lines, esp_err_to_name(err));
             return err;
         }
     }
@@ -310,5 +365,5 @@ esp_err_t gfx_flush(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel,
 
 esp_err_t gfx_flush_all(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel)
 {
-    return gfx_flush(canvas, panel, 0, 0, canvas->width, canvas->height);
+    return gfx_flush(canvas, panel, 0, canvas->origin_y, canvas->width, canvas->height);
 }

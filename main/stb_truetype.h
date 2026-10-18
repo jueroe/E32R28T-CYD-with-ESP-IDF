@@ -1,5 +1,14 @@
-// stb_truetype.h - v1.26 - public domain
+﻿// stb_truetype.h - v1.26 - public domain
 // authored from 2009-2021 by Sean Barrett / RAD Game Tools
+//
+// --- local changes for the E32R28T thermometer ---------------------------------
+// 1. stbtt__hheap_alloc(): the chunk size was 2000 entries below 32 bytes, i.e.
+//    a 56 KB block for the vertices of one 120 px glyph.  Such a block is not
+//    always available once WiFi and TLS have fragmented the heap, and a failed
+//    allocation is silent there - the glyph stays empty, which showed up as
+//    "all texts gone".  The chunk size is now 128/64/32; stb chains further
+//    chunks as needed.
+// -----------------------------------------------------------------------------
 //
 // =======================================================================
 //
@@ -2775,7 +2784,14 @@ static void *stbtt__hheap_alloc(stbtt__hheap *hh, size_t size, void *userdata)
       return p;
    } else {
       if (hh->num_remaining_in_head_chunk == 0) {
-         int count = (size < 32 ? 2000 : size < 128 ? 800 : 100);
+         // Local change for the E32R28T thermometer: upstream asks for 2000
+         // entries below 32 bytes, i.e. a 56 KB block for the vertices of one
+         // 120 px digit.  That block is not always available once WiFi and TLS
+         // have fragmented the heap, and a failed allocation here is silent -
+         // the glyph is simply left empty ("no text" on the display).  The heap
+         // grows by additional chunks when needed, so smaller chunks only cost
+         // a few more allocations.
+         int count = (size < 32 ? 128 : size < 128 ? 64 : 32);
          stbtt__hheap_chunk *c = (stbtt__hheap_chunk *) STBTT_malloc(sizeof(stbtt__hheap_chunk) + size * count, userdata);
          if (c == NULL)
             return NULL;

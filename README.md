@@ -12,10 +12,12 @@ verifiziert. Das Projekt wird zum Raumthermometer ausgebaut.
 | Funktion | Vorgabe |
 |---|---|
 | Sensor | BME280 (Temperatur, relative Luftfeuchte, Luftdruck) über I²C – **läuft** |
-| Uhrzeit | NTP, Anzeigeblock `hh:mm:ss` + Wochentag (Mo./Di. …) + `dd.mm.yy`, sekundengenau |
+| Uhrzeit | NTP über WLAN, Zeitzone Europe/Berlin – **läuft**, Anzeige vorerst `dd.mm. hh:mm` |
 | Temperatur | große Ziffern für die ganzen °C, Komma und eine Nachkommastelle, das `°` nur ein Viertel so groß |
 | Luftfeuchte | darunter, etwa halb so große Schrift, Format `xx,x %rF` |
+| Luftdruck | darunter, `967 hPa` |
 | Hintergrund | JPEG-Wallpapers nach Jahreszeit (Frühling/Sommer/Herbst/Winter) und Tageszeit (Morgen/Tag/Abend/Nacht), je Slot 3 Bilder zufällig, insgesamt 48 |
+| Sonnenauf-/-untergang | Werte von sunrise-sunset.org für 48.4149 / 11.0997 – **nur Platzhalter**, Abruf folgt |
 | Schnittstelle | HTTP-Endpunkt, der Temperatur und Luftfeuchte als JSON liefert (später Abruf durch eine Wetterstation) |
 | Ausrichtung | **Hochformat 240×320**, von der ursprünglichen Querformat-Ansicht um 90° nach rechts gedreht: (0,0) oben links, x bis 239 nach rechts, y bis 319 nach unten |
 
@@ -30,15 +32,64 @@ Texte; die Anwendung zeichnet nur noch die Werte hinein.
 
 | Element | Bereich | Umsetzung |
 |---|---|---|
-| Temperatur | frei positionierbar (aktuell x 25, Grundlinie y 175, `°`-Ecke 215/25) | `xx,x` mit 120 px hohen Ziffern, Komma und Nachkommastelle halb so groß und unten bündig, `°` separat platziert – [bigdigit.c](main/bigdigit.c), Werte in [layout.h](main/layout.h) |
-| Luftfeuchte | folgt | geplant |
-| Uhrzeit/Datum | folgt | geplant |
+| Temperatur | obere Kachel, frei positionierbar (aktuell x 25, Grundlinie y 160, `°`-Ecke 215/40) | `xx,x` mit 120 px hohen Ziffern, Komma und Nachkommastelle halb so groß und unten bündig, `°` separat platziert – [bigdigit.c](main/bigdigit.c), Werte in [layout.h](main/layout.h) |
+| Luftfeuchte, Luftdruck, Datum/Zeit | untere Kachel x 25…214, y 205…294 | drei zentrierte Zeilen `xx,x %rF`, `xxx hPa`, `dd.mm. hh:mm` – [infotile.c](main/infotile.c), Werte in [layout.h](main/layout.h) |
 
 Die Temperatur wird mit der eingebetteten **TrueType-Schrift Open Sans** gezeichnet
 ([ttf.c](main/ttf.c), Renderer `stb_truetype`, Font liegt als `EMBED_FILES` im
 Flash und wird ohne RAM-Kopie gelesen). Vorteil gegenüber den Bitmap-Fonts: jede
 Größe, saubere Kantenglättung, echte Schriftformen – und derselbe Renderer deckt
-später auch Uhrzeit, Datum und Luftfeuchte ab.
+auch Uhrzeit, Datum und Luftfeuchte ab.
+
+**Wichtig:** `stb_truetype` holt seine Zwischenpuffer (Glyphen-Vertices, Kurven-
+und Kantenlisten, Bitmap) aus dem Heap. Upstream fordert für die Vertices eines
+120-px-Glyphen einen Block von **56 KB** am Stück an (2000 Einträge à 28 Byte) –
+und eine fehlgeschlagene Allokation ist dort **stumm**: das Glyph bleibt einfach
+leer. Genau das passierte, sobald WiFi und TLS den Heap zerstückelt hatten (nur
+noch 43 KB zusammenhängend): Das Hintergrundbild blieb, alle Texte verschwanden.
+Deshalb ist in [stb_truetype.h](main/stb_truetype.h) die Chunk-Größe auf 128/64/32
+reduziert (stb hängt bei Bedarf weitere Chunks an), und jede Textausgabe wird
+nach dem Zeichnen geprüft – ein Band ohne Textpixel erzeugt eine Fehlerzeile im
+Log statt einer leeren Anzeige.
+
+### Warum die Anzeige in Bändern gezeichnet wird
+
+Ein vollständiger Framebuffer (240 × 320 × 2 Byte = **150 KB**) passt auf diesem
+ESP32 nicht mehr neben den WiFi-Stack: das DRAM-Segment ist 192 KB groß, die
+Bibliotheken belegen davon schon ~40 KB, und WiFi braucht weitere ~40 KB
+Sende-/Empfangspuffer. Deshalb zeichnet die Anwendung **zwei Bänder à 160 Zeilen**
+(77 KB Puffer) und schickt jedes Band direkt ans Display:
+
+1. `wallpaper_decode()` liest das JPEG in den RAM (14–20 KB) und prüft die Größe
+2. pro Band: `wallpaper_paint()` dekodiert das Bild mit **TJpgDec**
+   ([main/tjpgd](main/tjpgd)) in voller Auflösung und übernimmt nur die Zeilen des
+   Bandes – der Rest wird verworfen. Danach zeichnen `bigdigit`/`infotile` ihre
+   Texte mit Bildschirmkoordinaten darüber (das Canvas schneidet alles außerhalb
+   des Bandes ab), dann geht das Band per DMA an das Display.
+
+TJpgDec kann nicht anhalten, also läuft pro Band ein vollständiger Decoder-Durchlauf
+(das huffman-dekodierte Bild wird ja Zeile für Zeile geliefert). Bei 160 Zeilen
+Bandhöhe sind das **zwei Durchläufe** pro Frame, ein Frame dauert damit rund
+**275 ms** (davon ~110 ms Dekodieren pro Band). Kleinere Bänder sparen RAM,
+kosten aber weitere Durchläufe: `LAYOUT_BAND_HEIGHT 80` = 38 KB und vier
+Durchläufe.
+
+### RAM-Budget (Ist-Stand)
+
+| Posten | Größe |
+|---|---|
+| DRAM-Segment für Daten insgesamt | 192 KB |
+| davon statisch (Bibliotheken, WiFi, LVGL-frei, App) | ~40 KB |
+| Canvas 240×160 (ein Band) | 77 KB |
+| JPEG im RAM (größtes Wallpaper) | ~20 KB |
+| TJpgDec-Arbeitsspeicher | 4 KB |
+| **frei nach der Initialisierung** | **~166 KB** |
+| davon nimmt sich WiFi zur Laufzeit (Puffer, DHCP, lwIP) | ~40–60 KB |
+
+Ein voller Framebuffer hätte 150 KB gekostet und wäre damit nicht mehr
+unterzubringen gewesen. Für den HTTP-Server ist mit ~100 KB Rest reichlich Platz;
+die HTTPS-Abfrage der Sonnenzeiten belegt während des Handshakes kurzzeitig
+~25–30 KB und gibt sie danach wieder frei.
 
 ### Layout einstellen – [main/layout.h](main/layout.h)
 
@@ -49,13 +100,13 @@ Koordinaten gelten im Hochformat: (0,0) oben links, x bis 239 nach rechts, y bis
 | Makro | Bedeutung | aktuell |
 |---|---|---|
 | `LAYOUT_TEMP_X` | linke Kante der ersten großen Ziffer | 25 |
-| `LAYOUT_TEMP_BASELINE_Y` | Grundlinie = Unterkante der großen Ziffern; Komma-Schweif und Nachkommastelle enden hier ebenfalls | 175 |
+| `LAYOUT_TEMP_BASELINE_Y` | Grundlinie = Unterkante der großen Ziffern; Komma-Schweif und Nachkommastelle enden hier ebenfalls | 160 |
 | `LAYOUT_TEMP_MAX_WIDTH` | Breite, auf die die Zeichengruppe höchstens gestaucht wird | 190 |
 | `LAYOUT_TEMP_DIGIT_HEIGHT` | Höhe der beiden Ziffern vor dem Komma | 120 |
 | `LAYOUT_TEMP_MIN_SQUEEZE` | stärkste horizontale Stauchung; `1.0` = nie stauchen, `0.5` = sehr schmal | 0.55 |
 | `LAYOUT_TEMP_DECIMAL_SCALE` | Komma + Nachkommastelle relativ zur Ziffernhöhe | 0.5 |
 | `LAYOUT_TEMP_DEGREE_X` | rechte Kante des `°` | 215 |
-| `LAYOUT_TEMP_DEGREE_Y` | Oberkante des `°` | 25 |
+| `LAYOUT_TEMP_DEGREE_Y` | Oberkante des `°` | 40 |
 | `LAYOUT_TEMP_DEGREE_SCALE` | `°` relativ zur Ziffernhöhe | 0.5 |
 
 Die Positionen von Ziffernblock und Gradzeichen sind damit unabhängig: `x` und
@@ -63,22 +114,151 @@ Grundlinie gehören zum Zahlentext, `DEGREE_X/Y` bezeichnen die **obere rechte
 Ecke der Tinte** des Gradzeichens. Beides lässt sich frei auf dem Bildschirm
 platzieren, auch überlappend.
 
+Für die untere Kachel gilt dasselbe Prinzip: ein Rechteck plus drei
+Zeilenhöhen, der Block wird darin automatisch mittig gesetzt.
+
+| Makro | Bedeutung | aktuell |
+|---|---|---|
+| `LAYOUT_INFO_X` / `LAYOUT_INFO_Y` | linke obere Ecke des Textbereichs | 25 / 205 |
+| `LAYOUT_INFO_W` / `LAYOUT_INFO_H` | Breite und Höhe des Textbereichs | 190 / 90 |
+| `LAYOUT_INFO_HUMIDITY_CAP` | Ziffernhöhe der Feuchtezeile `xx,x %rF` | 24 |
+| `LAYOUT_INFO_PRESSURE_CAP` | Ziffernhöhe der Druckzeile `xxx hPa` | 18 |
+| `LAYOUT_INFO_TIME_CAP` | Ziffernhöhe der Zeile `dd.mm. hh:mm` | 18 |
+| `LAYOUT_INFO_GAP` | Abstand zwischen den Zeilen | 8 |
+| `LAYOUT_INFO_MIN_SQUEEZE` | stärkste Stauchung je Zeile; greift sie nicht, wird die Zeile kleiner | 0.6 |
+
+Dazu kommt `LAYOUT_BAND_HEIGHT` (160): die Höhe der Bänder, in denen gezeichnet
+wird (siehe oben). Sie muss `BOARD_SCREEN_HEIGHT` ohne Rest teilen und bestimmt
+Speicherbedarf **und** Rechenzeit: 160 Zeilen = 77 KB Puffer und zwei
+Decoder-Durchläufe, 80 Zeilen = 38 KB und vier Durchläufe.
+
+Jede Zeile wird waagerecht um `LAYOUT_INFO_X + LAYOUT_INFO_W/2` zentriert und
+steht mit ihrer Unterkante auf der jeweiligen Grundlinie. Die Summe aus
+Zeilenhöhen und Zwischenräumen wird senkrecht im Bereich zentriert – wird
+`LAYOUT_INFO_H` geändert, wandert der Block automatisch mit.
+
 Ablauf zum Ausprobieren: Wert ändern → `.\idf build` → `.\idf -p COM8 app-flash`
 → im Monitor die Zeilen ansehen:
 
 ```
-bigdigit: "21,8" cap 120 px, scale x/y 0.060/0.082, from x=25 on baseline y=175, 187 px wide
-bigdigit: degree: 27x25 px ink, top right corner at (215,25)
+bigdigit: "22,2" cap 120 px, scale x/y 0.060/0.082, from x=25 on baseline y=160, 187 px wide
+bigdigit: degree: 27x25 px ink, top right corner at (215,40)
+infotile: area x 25..214, y 205..294, centre line at x=120, block 76 px high from y=212
+infotile:   line 1 "47,2 %rF": cap 24 px, baseline y=236, 130 px wide
+infotile:   line 2 "967 hPa": cap 18 px, baseline y=262, 92 px wide
+infotile:   line 3 "18.10. 13:44": cap 18 px, baseline y=288, 136 px wide
 ```
 
 Regeln, die der Renderer anwendet:
 
+* Die Geometrie-Zeilen erscheinen einmal pro Frame (nur beim ersten Band), nicht
+  viermal.
 * Die Ziffern-Gruppe wird horizontal gestaucht, bis sie in `MAX_WIDTH` passt –
   aber höchstens bis `MIN_SQUEEZE`. Ist selbst das zu wenig, verringert der
-  Renderer die Ziffernhöhe, damit die Proportionen lesbar bleiben.
+  Renderer die Ziffernhöhe, damit die Proportionen lesbar bleiben. Für die
+  Infozeilen gilt dasselbe mit `LAYOUT_INFO_W` und `LAYOUT_INFO_MIN_SQUEEZE`.
 * Komma und Nachkommastelle sitzen mit ihrer Unterkante auf der Grundlinie; der
   Komma-Schweif endet ebenfalls dort.
 * Das Gradzeichen wird an `DEGREE_X/Y` ausgerichtet, egal wie groß es ist.
+* Feuchte und Druck kommen mit einer bzw. drei Nachkommastellen aus dem Sensor
+  (`47,1 %rF` mit deutschem Komma, `967 hPa`). Datum und Uhrzeit kommen aus der
+  NTP-Uhr; solange die nicht synchronisiert ist, zeigen die Zeilen die
+  Rückfallwerte `APP_FALLBACK_*` aus [main/main.c](main/main.c) (`01.01. 00:00`).
+
+## WLAN, Uhrzeit und Sonnenzeiten – [main/connect.h](main/connect.h), [main/wifi.c](main/wifi.c), [main/clock.c](main/clock.c), [main/sun.c](main/sun.c)
+
+Alles, was zur Installation gehört, steht in **`main/connect.h`**: SSID, Passwort,
+Hostname, NTP-Server, Zeitzone und die Koordinaten für sunrise-sunset.org.
+
+```c
+#define CONNECT_WIFI_SSID       "FRITZ!Box 7590 j.oe"
+#define CONNECT_WIFI_PASSWORD   "…"
+#define CONNECT_SNTP_SERVER     "de.pool.ntp.org"
+#define CONNECT_TZ              "CET-1CEST,M3.5.0,M10.5.0/3"   /* Europe/Berlin */
+#define CONNECT_LATITUDE_TEXT   "48.41490736914154"
+#define CONNECT_LONGITUDE_TEXT  "11.099721982616911"
+```
+
+`connect.h` enthält das WLAN-Passwort und steht deshalb in [.gitignore](.gitignore).
+Im Repository liegt nur die Vorlage [main/connect.example.h](main/connect.example.h):
+
+```powershell
+Copy-Item main\connect.example.h main\connect.h   # einmalig, dann Werte eintragen
+```
+
+Ablauf beim Start (der Netzwerkteil läuft in einer eigenen Task, die Anzeige
+startet also sofort):
+
+1. `clock_init()` setzt die Zeitzone (`setenv("TZ", …)` + `tzset()`), damit
+   `localtime_r()` Ortszeit liefert – inklusive Sommerzeit
+2. `wifi_connect()`: NVS, `esp_netif`, Event-Loop, Station-Modus, dann warten auf
+   die IP-Adresse. Nach einem Verbindungsabbruch wird neu verbunden; war das Gerät
+   schon einmal verbunden, endlos (Router-Neustart braucht keinen Geräte-Neustart)
+3. `clock_start_sntp()` + `clock_wait_for_sync()`: SNTP-Polling, ohne die Anzeige
+   zu blockieren
+4. `sun_fetch()` holt Sonnenauf-/-untergang, danach alle
+   `CONNECT_SUN_REFRESH_S` (6 h) erneut
+5. Die Uhrzeit erscheint in der unteren Kachel, sobald sie da ist – der
+   Neuzeichen-Takt (alle 10 s) merkt die Änderung selbst. Bis dahin stehen die
+   Rückfallwerte `APP_FALLBACK_*` aus [main.c](main/main.c) (`01.01. 00:00`)
+
+### Woher die Sonnenzeiten kommen
+
+Der Dateninput besteht aus **zwei Zahlen in `connect.h`** und einer daraus
+gebauten Adresse:
+
+```c
+#define CONNECT_LATITUDE_TEXT   "48.41490736914154"   /* Breite, Nord positiv, Süd negativ */
+#define CONNECT_LONGITUDE_TEXT  "11.099721982616911"  /* Länge, Ost positiv, West negativ */
+#define CONNECT_SUN_API_URL \
+    "https://api.sunrise-sunset.org/json?lat=" CONNECT_LATITUDE_TEXT \
+    "&lng=" CONNECT_LONGITUDE_TEXT "&formatted=0"
+```
+
+Für einen anderen Aufstellort also nur die beiden Textwerte ändern (Dezimalgrad
+mit Punkt, z. B. `"53.5511"` / `"9.9937"` für Hamburg) – URL und Abfrage folgen
+automatisch. Werte mit zu vielen Nachkommastellen sind unkritisch, die API
+rundet selbst.
+
+Der Ablauf in [sun.c](main/sun.c):
+
+1. HTTPS-GET auf `CONNECT_SUN_API_URL` (`esp_http_client`, Zertifikatsprüfung
+   gegen das CA-Bundle im Flash)
+2. Antwort ist JSON, daraus werden `status` und die beiden Felder `sunrise` und
+   `sunset` gelesen, z. B. `"sunrise":"2026-10-18T05:38:23+00:00"` (UTC)
+3. Umrechnung UTC → Ortszeit über `localtime_r()`, also inklusive Sommerzeit
+4. Ablage mit `clock_set_sun_times()`; lesbar über `clock_sunrise()` /
+   `clock_sunset()` (jeweils `hour`/`minute`/`valid`)
+
+Weil die Antwort nur aus einer flachen Liste fester Felder besteht, extrahiert
+`sun.c` die zwei Werte direkt aus dem Text, statt einen JSON-Parser
+einzubinden (kein zusätzliches Modul, ~1 KB Flash). Kommt künftig mehr aus der
+API, wäre ein richtiger Parser der nächste Schritt.
+
+Bis zur ersten erfolgreichen Abfrage stehen in [clock.c](main/clock.c) die
+Platzhalter 07:39 / 18:19 mit `valid = false`; nach dem Abruf sind sie gültig und
+`clock_log_now()` protokolliert sie ohne den Zusatz „(placeholder)".
+
+### HTTPS und Zertifikate
+
+`api.sunrise-sunset.org` hängt bei Google Trust Services; das Zertifikat wird von
+`WE1` ausgestellt, die Kette endet bei `GTS Root R4` – allerdings in der
+**cross-signierten** Variante (ausgestellt von GlobalSign Root CA, die nicht im
+CA-Bundle von ESP-IDF liegt). Deshalb steht in
+[sdkconfig.defaults](sdkconfig.defaults):
+
+```
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+```
+
+Ohne diese Option bricht der Handshake mit `esp-x509-crt-bundle: No matching
+trusted root certificate found` ab (`mbedtls_ssl_handshake returned -0x3000`).
+Ebenso wichtig: `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN` bleibt bei 16 KB, denn die
+Zertifikatskette kommt als ein TLS-Record und passt nicht in 4 KB.
+
+Die TLS-Sitzung braucht während der Abfrage etwa 25–30 KB Heap; danach ist der
+Speicher wieder frei (die Anzeige läuft während der Abfrage weiter, weil sie in
+der Thermometer-Task läuft).
 
 ## Hardware
 
@@ -87,7 +267,7 @@ Regeln, die der Renderer anwendet:
 | Modul | ESP32-32E, ESP32-D0WD-V3, 240 MHz, 520 KB SRAM, kein PSRAM, 4 MB QSPI-Flash |
 | Display | 2.8" TN-TFT, 240×320, **ILI9341V**, 4-Draht-SPI, Weiß-LED-Backlight an GPIO21 |
 | Touch | **XPT2046** (resistiv) an eigenem SPI-Bus, PENIRQ an GPIO36 |
-| Sonstiges | RGB-LED (R/G/B = 22/16/17, Low-aktiv), BOOT-Taster an GPIO0, microSD, Lautsprecher |
+| Sonstiges | RGB-LED (R/G/B = 22/16/17, Low-aktiv, jetzt PWM), BOOT-Taster an GPIO0, microSD, Lautsprecher |
 
 Alle verwendeten Pins stehen gesammelt in
 [board_e32r28t.h](main/board_e32r28t.h); Quelle sind die Pin-Tabelle der
@@ -138,9 +318,8 @@ nutzbar.
 
 Bewusste Entscheidungen:
 
-* **3 MB App**: WiFi, NTP, HTTP-Server, LVGL und JPEG-Decoder brauchen deutlich
-  mehr als die 1 MB der Standardtabelle (aktueller Teststand: 192 KB, also 94 %
-  der Partition frei).
+* **3 MB App**: der WiFi-Stack allein bringt ~560 KB mit (aktueller Teststand:
+  991 KB, also 68 % der Partition frei). Platz für HTTP-Server und TLS ist da.
 * **1 MB littlefs** ist auf diesem Gerät bereits voll: die 48 vorhandenen
   Wallpaper belegen 992 KiB inklusive littlefs-Overhead (Details unter
   [Wallpaper-Ablage](#wallpaper-ablage)). Für mehr Bilder die App-Partition
@@ -165,22 +344,27 @@ Bereich, der vorher unbenutzt war.
 ## Was das Programm macht
 
 1. Backlight aus, RGB-LED initialisieren, danach **Selbsttest der LED**: rot,
-   grün, blau, weiß nacheinander für je 400 ms (steht so im Log)
+   grün, blau, weiß nacheinander für je 400 ms (steht so im Log); anschließend
+   übernimmt die LED-Task (siehe [RGB-LED als Ambilight](#rgb-led-als-ambilight-statusledh))
 2. ILI9341 über SPI2 hochfahren (40 MHz) in den **Hochformat-Modus 240×320**
    (ESP-IDF 6 nennt die beiden freien Busse SPI1/SPI2; die Header verwenden die
    weiterhin gültigen Aliase `SPI2_HOST`/`SPI3_HOST`, im Monitor erscheint
    deshalb „SPI1" für das Display und „SPI2" für den Touch)
-3. Canvas 240×320 anlegen (Framebuffer 150 KB, DMA-fähig)
+3. Canvas 240×160 anlegen (77 KB, DMA-fähig) – die Anzeige wird in zwei Bändern
+   gezeichnet, siehe [Warum die Anzeige in Bändern gezeichnet wird](#warum-die-anzeige-in-bändern-gezeichnet-wird)
 4. littlefs-Partition `storage` einhängen (beim ersten Mal formatieren), Belegung
    und Dateianzahl loggen
 5. BME280 über I²C initialisieren (Adresse 0x76, 16× Oversampling); der Init
    kehrt erst zurück, wenn eine vollständige Messung vorliegt
 6. XPT2046 initialisieren
-7. Backlight auf 100 %, LED grün
-8. **Thermometer-Schleife**: Wallpaper dekodieren (JPEG → RGB565 direkt in den
-   Canvas), Temperatur als `xx,x°` in die Kachel zeichnen, Frame senden. Alle
-   10 s eine neue Messung; neu gezeichnet wird nur, wenn sich die Anzeige
-   (Zehntelgrad) ändert.
+7. Zeitzone setzen, **Netzwerk-Task starten** (WLAN + NTP, läuft im Hintergrund)
+8. Backlight auf 100 %, LED grün
+9. **Thermometer-Schleife**: Wallpaper lesen und prüfen, dann pro Band
+   dekodieren (voller Auflösung), Temperatur als `xx,x°` in die obere Kachel
+   zeichnen, darunter in der unteren Kachel Feuchte, Luftdruck und Datum/Uhrzeit,
+   Band senden. Alle 10 s eine neue Messung; neu gezeichnet wird nur, wenn sich
+   ein angezeigter Wert ändert (Zehntelgrad, Zehntel-Prozent Feuchte, ganze hPa,
+   Minute).
 
 Das alte Hardware-Testbild liegt getrennt in
 [testscreen.c](main/testscreen.c)/[testscreen.h](main/testscreen.h) (Muster,
@@ -271,6 +455,58 @@ Hinweise:
   nur die App geändert hat. Wer das nicht will, flasht die App gezielt mit
   `.\idf app-flash` (Tabelle und Image bleiben dann unangetastet).
 
+### Welches Bild wann erscheint
+
+Die Regeln stehen als `#define`-Block oben in [main/wallpaper.h](main/wallpaper.h)
+und werden von `wallpaper_daytime_for()` / `wallpaper_season_from_month()`
+angewendet:
+
+| Wechsel | Auslöser |
+|---|---|
+| → `morning` | Sonnenaufgang (von sunrise-sunset.org, `clock_sunrise()`) |
+| `morning` → `day` | `WALLPAPER_MORNING_END_HOUR` = **9:00**, im Winter `WALLPAPER_MORNING_END_HOUR_WINTER` = **10:00** |
+| → `evening` | Sonnenuntergang (`clock_sunset()`) |
+| → `night` | `WALLPAPER_NIGHT_START_HOUR` = **23:00** (und nach Mitternacht bis Sonnenaufgang) |
+
+Die Jahreszeit folgt den meteorologischen Blöcken: Dezember–Februar Winter,
+März–Mai Frühling, Juni–August Sommer, September–November Herbst.
+
+Beim Wechsel des Slots (Jahreszeit oder Tageszeit) wird **eines der drei Bilder
+zufällig** gewählt (`wallpaper_random_index()`); innerhalb eines Slots bleibt es
+stehen. Geprüft wird im 10-s-Takt der Messschleife, ein Wechsel erfolgt also
+innerhalb von 10 s nach dem auslösenden Zeitpunkt.
+
+Sind die Sonnenzeiten noch nicht bekannt (kein WLAN, erste Sekunden nach dem
+Start), gelten die Ersatzwerte `WALLPAPER_SUNRISE_FALLBACK_*` (07:00) und
+`WALLPAPER_SUNSET_FALLBACK_*` (19:00). Solange die NTP-Uhr fehlt, rechnet die
+Auswahl mit dem Rückfall-Datum (`01.01. 00:00` → Winter/Nacht); sobald die Zeit
+da ist, springt der Hintergrund auf den richtigen Slot (im Log als
+`cyd: background …` sichtbar).
+
+## RGB-LED als Ambilight – [main/statusled.h](main/statusled.h)
+
+Das Gerät hängt im Acrylrahmen etwa 15 mm vor einer weißen Wand; die RGB-LED
+leuchtet diese Wand von hinten aus. Die drei Kanäle hängen jetzt an
+**LEDC-PWM** (Timer 0, 20 kHz, 10 Bit – derselbe wie das Backlight, Kanäle 1–3),
+deshalb sind Helligkeit und Farbverläufe stufenlos möglich.
+
+| Modus | Verhalten |
+|---|---|
+| Nacht (`DAYTIME_NIGHT`) | **Regenbogen-Fade** als Ambilight: rot → gelb → grün → cyan → blau → magenta → rot, ein Umlauf pro `STATUSLED_AMBIENT_PERIOD_MS` (60 s), Aktualisierung alle 50 ms (1200 Stufen pro Umlauf) |
+| alle anderen Tageszeiten | weiß mit `STATUSLED_IDLE_BRIGHTNESS` (30 % PWM-Tastgrad) |
+
+```c
+#define STATUSLED_AMBIENT_PERIOD_MS   60000   /* ein Farbumlauf im Nachtmodus */
+#define STATUSLED_AMBIENT_BRIGHTNESS  100     /* Prozent */
+#define STATUSLED_IDLE_BRIGHTNESS      30     /* Prozent, weiß */
+```
+
+Der Modus folgt der Tageszeit aus `wallpaper_update()` in [main/main.c](main/main.c);
+im Log steht pro Wechsel `status LED: rainbow fade (night)` bzw.
+`status LED: white, dimmed`. `statusled_set()` (Selbsttest, BOOT-Taste im
+Testbild) schaltet die Automatik ab, bis wieder `statusled_ambilight()` aufgerufen
+wird.
+
 ## Voraussetzungen
 
 * ESP-IDF **v6.1** – auf diesem Rechner installiert unter `C:\esp\v6.1\esp-idf`
@@ -280,6 +516,8 @@ Hinweise:
 * USB-Datenkabel (Type-C) – das Board wird als USB-Seriell-Adapter erkannt
   (auf diesem Rechner waren zum Zeitpunkt des Erstellens **keine** Ports außer
   zwei Bluetooth-Ports vorhanden, also bitte Board anstecken)
+* 2,4-GHz-WLAN in Reichweite; SSID und Passwort in [main/connect.h](main/connect.h)
+  (aus [connect.example.h](main/connect.example.h) kopieren)
 
 ## Bauen, Flashen, Monitor
 
@@ -377,27 +615,36 @@ Component Registry nach `managed_components/`:
 * `espressif/bme280` 0.1.1 + `espressif/i2c_bus` 1.5.2 (Sensor am I²C-Bus; die
   i2c_bus-Version nutzt ab ESP-IDF 5.3 den neuen `i2c_master`-Treiber, der alte
   `driver/i2c.h` existiert in IDF 6 nicht mehr)
-* `espressif/esp_jpeg` 1.3.1 (JPEG-Decoder für die Wallpaper)
+* `espressif/esp_jpeg` – **nicht mehr nötig**: der JPEG-Decoder TJpgDec liegt als
+  Quelltext unter [main/tjpgd](main/tjpgd) (R0.03, (C)ChaN 2021, freie Lizenz) und
+  wird direkt angesprochen, weil nur er die Ausgabe bandweise wegwerfen kann.
+  Konfiguration in [main/tjpgd/tjpgdcnf.h](main/tjpgd/tjpgdcnf.h)
 
 Zum Testen ohne Hardware genügt `.\idf build` – es ist bereits erfolgreich
-durchgelaufen (App-Binärdatei 434 KB inklusive 147 KB Schrift in einer
-3008-KB-Partition, Flash 4 MB,
-CPU 240 MHz).
+durchgelaufen (App-Binärdatei 966 KB inklusive 147 KB Schrift und WiFi-Stack in
+einer 3008-KB-Partition, Flash 4 MB, CPU 240 MHz).
 
 ## Projektstruktur
 
 | Datei | Zweck |
 |---|---|
-| [main/main.c](main/main.c) | Ablauf: Backlight, LCD-Init, littlefs, Sensor, Thermometer-Schleife (`APP_SHOW_TESTSCREEN` schaltet das Testbild ein) |
+| [main/main.c](main/main.c) | Ablauf: Backlight, LCD-Init, littlefs, Sensor, Netzwerk-Task, Thermometer-Schleife mit Slot-Wechsel (`APP_SHOW_TESTSCREEN` schaltet das Testbild ein) |
 | [main/board_e32r28t.h](main/board_e32r28t.h) | Alle Pins, Auflösung, Ausrichtung, SPI-Takt, Farb- und Touch-Kalibrierwerte |
-| [main/wallpaper.c](main/wallpaper.c), [main/wallpaper.h](main/wallpaper.h) | JPEG → Canvas, Slot-Auswahl über `background.h`, Jahreszeit/Tageszeit aus Datum/Uhrzeit |
+| [main/connect.h](main/connect.h) | **Konfiguration der Installation**: WLAN, NTP, Zeitzone, Koordinaten (nicht im Repository, Vorlage: [connect.example.h](main/connect.example.h)) |
+| [main/wifi.c](main/wifi.c), [main/wifi.h](main/wifi.h) | WLAN-Station: NVS, `esp_netif`, Event-Handler, Verbindungsaufbau mit Wiederholung |
+| [main/clock.c](main/clock.c), [main/clock.h](main/clock.h) | Zeitzone, SNTP, Ortszeit, Ablage der Sonnenzeiten |
+| [main/sun.c](main/sun.c), [main/sun.h](main/sun.h) | Sonnenauf-/-untergang von sunrise-sunset.org holen und umrechnen (HTTPS) |
+| [main/wallpaper.c](main/wallpaper.c), [main/wallpaper.h](main/wallpaper.h) | JPEG lesen, bandweise mit TJpgDec in voller Auflösung malen, Slot-Auswahl (Jahreszeit/Tageszeit + Zufallsbild) |
+| [main/tjpgd](main/tjpgd) | JPEG-Decoder TJpgDec R0.03 mit eigener Konfiguration (`tjpgdcnf.h`) |
 | [main/bigdigit.c](main/bigdigit.c), [main/bigdigit.h](main/bigdigit.h) | Große Temperaturanzeige `xx,x°` mit dem TrueType-Renderer |
-| [main/layout.h](main/layout.h) | Alle Layout-Werte der Anzeige (Kachel, Ziffernhöhe, Komma-/Gradgröße) |
+| [main/infotile.c](main/infotile.c), [main/infotile.h](main/infotile.h) | Untere Kachel: Feuchte, Luftdruck, Datum/Zeit als drei zentrierte Zeilen |
+| [main/layout.h](main/layout.h) | Alle Layout-Werte der Anzeige (beide Kacheln, Ziffernhöhen, Komma-/Gradgröße, Bandhöhe) |
 | [main/ttf.c](main/ttf.c), [main/ttf.h](main/ttf.h) | TrueType-Text: `stb_truetype`, Anti-Aliasing, Stauchung |
 | [main/fonts/OpenSans-Regular.ttf](main/fonts) | Schrift (Apache 2.0), per `EMBED_FILES` im App-Image |
+| [main/stb_truetype.h](main/stb_truetype.h) | TrueType-Rasterizer (public domain), mit einer lokalen Anpassung: kleinere Heap-Chunks (siehe oben) |
 | [main/testscreen.c](main/testscreen.c), [main/testscreen.h](main/testscreen.h) | Hardware-Testbild, Statuszeile, Touch-Punkte, BOOT-Neudruck (separat entfernbar) |
-| [main/statusled.c](main/statusled.c), [main/statusled.h](main/statusled.h) | RGB-LED inkl. Selbsttest |
-| [main/gfx.c](main/gfx.c), [main/gfx.h](main/gfx.h) | Mini-Grafikbibliothek: Canvas, Rechtecke, Linien, Kreis, Text, Flush |
+| [main/statusled.c](main/statusled.c), [main/statusled.h](main/statusled.h) | RGB-LED über LEDC-PWM: Selbsttest, Regenbogen-Ambilight bei Nacht, sonst gedimmtes Weiß |
+| [main/gfx.c](main/gfx.c), [main/gfx.h](main/gfx.h) | Mini-Grafikbibliothek: Canvas (auch als Band), Rechtecke, Linien, Kreis, Text, Flush |
 | [main/gfx_color.h](main/gfx_color.h) | RGB565-Farbmakros, ohne ESP-IDF-Abhängigkeit (auch für Datentabellen nutzbar) |
 | [main/font5x7.c](main/font5x7.c), [main/font5x7.h](main/font5x7.h) | 5×7-Pixel-Font (A–Z, 0–9, Satzzeichen), generiert |
 | [main/touch.c](main/touch.c), [main/touch.h](main/touch.h) | XPT2046: SPI-Bus, `esp_lcd_touch`, Rohwert → Bildschirmkoordinate |
@@ -407,45 +654,62 @@ CPU 240 MHz).
 | [data/](data) | Inhalt der littlefs-Partition (Wallpaper), wird beim Bauen zum Image |
 | [main/idf_component.yml](main/idf_component.yml) | Abhängigkeiten aus der Component Registry |
 | [tools/gen_font5x7.py](tools/gen_font5x7.py) | Erzeugt den Font neu (Glyphen als ASCII-Art, mit Probedruck) |
-| [sdkconfig.defaults](sdkconfig.defaults) | 4 MB Flash, 240 MHz CPU, Ziel esp32, eigene Partitionstabelle, littlefs-Namenslänge 128, Z-Druckschwelle des Touch-Treibers |
+| [sdkconfig.defaults](sdkconfig.defaults) | 4 MB Flash, 240 MHz CPU, Ziel esp32, eigene Partitionstabelle, littlefs-Namenslänge 128, Z-Druckschwelle des Touch-Treibers, WiFi-Puffer (RAM), TLS-Optionen für HTTPS |
 | [partitions.csv](partitions.csv) | Partitionstabelle: nvs, phy_init, 3 MB App, 1 MB littlefs |
 | [idf.cmd](idf.cmd) | Wrapper: `.\idf build` / `.\idf -p COM8 flash monitor` ohne ESP-IDF-Profil |
 
 ## Erwartete Ausgabe auf dem seriellen Monitor
 
 ```
-I (xxx) cyd: --- E32R28T CYD first tests, ESP-IDF v6.1.0 ---
-I (xxx) cyd: heap: 293000 bytes free, largest free block 290000 bytes
-I (xxx) cyd: RGB LED: red
-I (xxx) cyd: RGB LED: green
-I (xxx) cyd: RGB LED: blue
-I (xxx) cyd: RGB LED: white (all three)
-I (xxx) cyd: RGB LED: off
-I (xxx) cyd: SPI2 for ILI9341: SCLK=14 MOSI=13 MISO=12 CS=15 DC=2 RST=EN
-I (xxx) cyd: ILI9341 ready, 320x240 landscape, 40 MHz SPI clock, BGR element order
-I (xxx) gfx: canvas 320x240: framebuffer 153600 bytes, bounce buffer 15360 bytes
-I (xxx) cyd: test pattern drawn, backlight on - press BOOT (GPIO0) to redraw
-I (xxx) touch: SPI3 for XPT2046: SCK=25 MOSI=32 MISO=39 CS=33
-I (2464) touch: XPT2046 ready, raw axes 300..3805 / 215..3712, swap=1 mirror=1/1
-I (2436) cyd: ILI9341 ready, 240x320 portrait, 40 MHz SPI clock, BGR element order
-I (2436) gfx: canvas 240x320: framebuffer 153600 bytes, bounce buffer 11520 bytes
-I (2546) storage: littlefs mounted at /littlefs: 1024 KiB total, 36 KiB free
+I (560) cyd: --- E32R28T room thermometer, ESP-IDF v6.1 ---
+I (570) cyd: heap: 272640 bytes free, largest free block 139264 bytes
+I (600) statusled: RGB LED: red
+I (1000) statusled: RGB LED: green
+I (1410) statusled: RGB LED: blue
+I (1810) statusled: RGB LED: white (all three)
+I (2210) statusled: RGB LED: off
+I (2570) cyd: SPI1 for ILI9341: SCLK=14 MOSI=13 MISO=12 CS=15 DC=2 RST=EN
+I (2690) cyd: ILI9341 ready, 240x320 portrait, 40 MHz SPI clock, BGR element order
+I (2690) gfx: canvas 240x160: 76800 bytes
+I (2750) storage: littlefs mounted at /littlefs: 1024 KiB total, 36 KiB free
 …   (16 Ordnerzeilen, je 3 Dateien)
-I (4446) storage: 48 files in total (48 JPEG), 728964 bytes
-I (4446) sensor: I2C0 for BME280: SDA=23 SCL=27, 100 kHz, address 0x76
-I (4456) i2c_bus: I2C Bus V2 uses the externally initialized bus handle
-I (4846) sensor: BME280 ready, first reading: 21.08 C, 49.5 %rH, 967.2 hPa
-I (4930) touch: XPT2046 ready, raw axes 300..3805 / 215..3712, swap=0 mirror=1/0
-I (4940) ttf: 147528 byte font loaded, ascent 2189 / descent -600 / gap 0 (font units)
-I (4950) cyd: 126580 free heap bytes after initialisation
-I (4950) cyd: wallpaper slot 1/2/1: /littlefs/backgrounds/summer/evening/ocean-sunset.jpg, text colour 0x1F00
-I (5070) wallpaper: …/ocean-sunset.jpg: 240x320, 14222 bytes JPEG -> RGB565
-I (5080) bigdigit: "21,8" cap 120 px, scale x/y 0.060/0.082, from x=25 on baseline y=175, 187 px wide
-I (5080) bigdigit: degree: 27x25 px ink, top right corner at (215,25)
-I (5110) cyd: frame: 21,8 degC, text from (25,175), 187 px wide, degree at (215,25), decode 103 ms, total 148 ms
-I (15110) cyd: BME280: 21.92 C, 47.1 %rH, 967.3 hPa
-I (15220) bigdigit: "21,9" cap 120 px, scale x/y 0.060/0.082, from x=25 on baseline y=175, 187 px wide
+I (4650) storage: 48 files in total (48 JPEG), 728964 bytes
+I (4650) sensor: I2C0 for BME280: SDA=23 SCL=27, 100 kHz, address 0x76
+I (5060) sensor: BME280 ready, first reading: 22.08 C, 47.0 %rH, 966.8 hPa
+I (5060) touch: SPI2 for XPT2046: SCK=25 MOSI=32 MISO=39 CS=33
+I (5060) touch: XPT2046 ready, raw axes 300..3805 / 215..3712, swap=0 mirror=1/0
+I (5070) ttf: 147528 byte font loaded, ascent 2189 / descent -600 / gap 0 (font units)
+I (5160) clock: time zone Europe/Berlin (CET-1CEST,M3.5.0,M10.5.0/3)
+I (5180) cyd: 163112 free heap bytes after initialisation
+I (5567) cyd: band 0..159: 5046 text pixels
+I (5677) cyd: band 160..319: 875 text pixels
+I (5881) wallpaper: /littlefs/backgrounds/summer/evening/ocean-sunset.jpg: 240x320, 14222 bytes JPEG, YCbCr
+I (5990) bigdigit: "22,1" cap 120 px, scale x/y 0.060/0.082, from x=25 on baseline y=160, 187 px wide
+I (6000) bigdigit: degree: 27x25 px ink, top right corner at (215,40)
+I (6010) infotile: area x 25..214, y 205..294, centre line at x=120, block 76 px high from y=212
+I (6010) infotile:   line 1 "47,0 %rF": cap 24 px, baseline y=236, 130 px wide
+I (6020) infotile:   line 2 "967 hPa": cap 18 px, baseline y=262, 92 px wide
+I (6030) infotile:   line 3 "01.01. 00:00": cap 18 px, baseline y=288, 136 px wide
+I (6191) cyd: frame: 22,1 degC, text from (25,160), 187 px wide, degree at (215,40), decode 114 ms, total 421 ms
+I (6990) wifi: connected to "FRITZ!Box 7590 j.oe", IP 192.168.123.122
+I (7000) wifi: link to "FRITZ!Box 7590 j.oe": channel 1, RSSI -43 dBm, IP 192.168.123.122
+I (7000) clock: NTP server de.pool.ntp.org, querying ...
+I (8100) clock: NTP answer received, 18.10.2026 16:17:12 (Europe/Berlin)
+I (8100) clock: clock synchronised after 1100 ms
+I (8100) clock: time is 18.10.2026 16:17:12 (Europe/Berlin)
+I (8100) clock: sun at 48.41490736914154: rise 07:39 (placeholder), set 18:19 (placeholder)
+I (9557) sun: sunrise 07:38, sunset 18:23 (Europe/Berlin)
+I (16221) cyd: 18.10.2026 16:17:22 BME280: 22.40 C, 47.2 %rH, 966.8 hPa, IP 192.168.123.122
+I (15777) cyd: background 2/1/0 at 18.10. 17:37: …/backgrounds/autumn/day/wild-flowers-desert.jpg, text colour 0xFFFF
+I (15777) cyd: status LED: white, dimmed
+I (16471) cyd: frame: 22,4 degC, text from (25,160), 187 px wide, degree at (215,40), decode 27 ms, total 276 ms
 ```
+
+Der erste Frame steht nach etwa 6 s (ohne auf das Netzwerk zu warten), die
+Uhrzeit erscheint mit dem nächsten 10-s-Refresh nach dem NTP-Antwort, die
+Sonnenzeiten nach der HTTPS-Abfrage. Beispiel für einen Start ohne WLAN:
+`W (21520) clock: no NTP answer …`, danach läuft die Anzeige mit `01.01. 00:00`
+weiter.
 
 ## Fehlersuche
 
@@ -469,7 +733,12 @@ I (15220) bigdigit: "21,9" cap 120 px, scale x/y 0.060/0.082, from x=25 on basel
 | Schrift wirkt zu schmal/gestaucht | `LAYOUT_TEMP_MIN_SQUEEZE` in [layout.h](main/layout.h) erhöhen (1.0 = nie stauchen, Schrift wird stattdessen kleiner) |
 | Schrift/° zu groß oder zu klein | `LAYOUT_TEMP_DIGIT_HEIGHT` bzw. `LAYOUT_TEMP_DEGREE_SCALE` in [layout.h](main/layout.h) – Kontrolle über die `bigdigit:`-Zeilen im Log |
 | Text sitzt an der falschen Stelle | `LAYOUT_TEMP_X` / `LAYOUT_TEMP_BASELINE_Y` bzw. `LAYOUT_TEMP_DEGREE_X/Y` in [layout.h](main/layout.h) |
+| Untere Zeilen zu groß/klein oder falsch verteilt | `LAYOUT_INFO_*_CAP`, `LAYOUT_INFO_GAP` und `LAYOUT_INFO_MIN_SQUEEZE` in [layout.h](main/layout.h) – Kontrolle über die `infotile:`-Zeilen im Log (Blockhöhe und Grundlinien je Zeile) |
+| Infozeilen fehlen komplett | `infotile.c` muss in der `SRCS`-Liste von [main/CMakeLists.txt](main/CMakeLists.txt) stehen, sonst fehlt der Aufruf im Image |
+| `band … has no text pixels` im Log | Die Textausgabe ist leer geblieben: dafür fehlte `stb_truetype` ein zusammenhängender Puffer. Prüfen, ob `LAYOUT_BAND_HEIGHT`/`LAYOUT_TEMP_DIGIT_HEIGHT` kleiner gestellt wurden bzw. ob der Heap zu knapp ist (Heap-Zeile im Log). Normalerweise darf diese Meldung nicht auftreten |
 | Kein Text, Log zeigt `font could not be loaded` | `fonts/OpenSans-Regular.ttf` fehlt oder ist beschädigt; Datei prüfen und neu bauen (`EMBED_FILES` in [main/CMakeLists.txt](main/CMakeLists.txt)) |
+| Texte verschwinden nach einigen Sekunden | War ein Fehler in `stb_truetype` (56-KB-Block nach Heap-Fragmentierung durch WiFi/TLS) – behoben durch die kleinere Chunk-Größe in [stb_truetype.h](main/stb_truetype.h). Tritt es wieder auf, steht jetzt `band … has no text pixels` im Log |
+| `ttf: no memory for … bytes (free …, largest …)` | Der Renderer konnte einen Zwischenpuffer nicht anlegen (siehe oben) – die Anzeige bleibt in diesem Frame ohne Text |
 | Touch trifft um 90° versetzt | Touch-Flags passend zur Anzeige: `BOARD_TOUCH_SWAP_XY` / `BOARD_TOUCH_MIRROR_X/Y` – siehe [Touch-Kalibrierung](#touch-kalibrierung) |
 | Bildschirm bleibt dunkel, Log endet mit `cyd: LCD bring-up failed` | Fehlerzeile darüber lesen (SPI/Registrierung). Backlight an GPIO21 prüfen – manche Board-Revisionen nutzen GPIO27 (`BOARD_LCD_PIN_BACKLIGHT`) |
 | Bild ist da, aber wie ein Negativ | `BOARD_LCD_INVERT_COLORS` auf `1` setzen |
@@ -477,11 +746,25 @@ I (15220) bigdigit: "21,9" cap 120 px, scale x/y 0.060/0.082, from x=25 on basel
 | Bild seitenverkehrt | `BOARD_LCD_MIRROR_X` umschalten (bzw. `BOARD_LCD_MIRROR_Y`) |
 | Bild um 90° verdreht | `BOARD_LCD_LANDSCAPE` auf `0` setzen (Hochformat) |
 | Streifen, Flackern, Farbrauschen | `BOARD_LCD_PIXEL_CLOCK_HZ` auf `20 * 1000 * 1000` reduzieren |
-| `not enough memory for the 320x240 canvas` | Heap-Optionen/BT/WiFi abgeschaltet lassen; der Framebuffer braucht 150 KB + 15 KB Puffer |
+| `not enough memory for the 240x160 band canvas` | Heap-Optionen/BT abgeschaltet lassen; ein Band braucht 77 KB. Bleibt es knapp: `LAYOUT_BAND_HEIGHT` in [layout.h](main/layout.h) halbieren (80 Zeilen = 38 KB, dafür vier Decoder-Durchläufe) |
+| `cannot reach "…" (reason 201 …)` im Log | Access Point nicht gefunden: SSID in [connect.h](main/connect.h) prüfen (Groß-/Kleinschreibung, 2,4 GHz – der ESP32 kann kein 5-GHz-Band), Gerät weiter vom Router entfernt |
+| `reason 15` beim Verbinden | Passwort falsch: `CONNECT_WIFI_PASSWORD` in [connect.h](main/connect.h) prüfen |
+| `connect.h: No such file or directory` | [connect.h](main/connect.h) fehlt, weil sie nicht im Repository liegt: `Copy-Item main\connect.example.h main\connect.h` und Werte eintragen |
+| Uhrzeit bleibt `01.01. 00:00` | Platzhalter aus [main.c](main/main.c): kein WLAN, kein NTP-Antwort innerhalb `CONNECT_SNTP_WAIT_MS`, oder Port 123/UDP von der Firewall blockiert. Testweise anderen Server in `CONNECT_SNTP_SERVER` eintragen (`pool.ntp.org`) |
+| `sun: request failed: ESP_ERR_HTTP_CONNECT` mit `No matching trusted root certificate found` | `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y` fehlt (siehe [HTTPS und Zertifikate](#https-und-zertifikate)) |
+| `sun: request failed: ESP_ERR_HTTP_CONNECT` ohne Zertifikatsmeldung | Kein Internetzugang/DNS, `CONNECT_SUN_TIMEOUT_MS` zu klein, oder Port 443 blockiert. Für Details `esp_log_level_set("esp-tls", ESP_LOG_DEBUG)` in [sun.c](main/sun.c) setzen und den Monitor ansehen |
+| `sun: API did not answer with status OK` | Der Dienst meldet z. B. `INVALID_REQUEST`: Koordinaten in [connect.h](main/connect.h) prüfen (Punkt als Dezimaltrenner, Bereich −90…90 bzw. −180…180) |
+| Sonnenzeiten bleiben bei `(placeholder)` | Die Abfrage läuft alle `CONNECT_SUN_REFRESH_S` (6 h); nach einem Fehlversuch dauert es also bis zu 6 h. Für einen Test den Wert kurz auf 60 setzen |
+| `mbedtls_ssl_handshake returned -0x3000` (X509) | Siehe [HTTPS und Zertifikate](#https-und-zertifikate): 16-KB-TLS-Puffer und Cross-Signed-Option |
+| Uhrzeit um 1–2 h falsch | Zeitzone: `CONNECT_TZ` in [connect.h](main/connect.h) muss `CET-1CEST,M3.5.0,M10.5.0/3` sein (posix-Regel: `CET` = UTC+1, `CEST` = UTC+2) |
+| Wallpaper wirkt unscharf | Sollte nicht mehr vorkommen: seit dem Wechsel auf TJpgDec wird in voller Auflösung dekodiert. Bleibt es unscharf, stammt die geladene Datei aus einem älteren Image – `.\idf -p COM8 flash` schreibt auch die littlefs-Partition neu |
+| `wallpaper: … : broken data` / `not a baseline JPEG` | Das JPEG ist beschädigt oder progressiv kodiert; TJpgDec versteht nur Baseline-JPEG. Datei neu speichern (z. B. mit „Progressive" aus) |
+| `wallpaper: … work area too small` | `WALLPAPER_WORK_SIZE` in [wallpaper.c](main/wallpaper.c) erhöhen (4 KB reichen für `JD_FASTDECODE 1`) |
 | Touch reagiert nicht | `BOARD_TOUCH_ENABLE 1` prüfen, Log der Init-Zeilen ansehen; der Punkt hängt am MISO-Pin GPIO39 |
 | Punkt erscheint nicht unter dem Finger | Touch neu kalibrieren, Anleitung im Abschnitt [Touch-Kalibrierung](#touch-kalibrierung) |
 | Touch-Koordinaten springen | `BOARD_TOUCH_Z_THRESHOLD` **und** `CONFIG_XPT2046_Z_THRESHOLD` (in `sdkconfig`, Default im Treiber: 400) erhöhen – beide müssen passen. Gemessen auf diesem Board: Z zwischen ~430 (unten links, der schwächste Punkt) und ~2700 (oben rechts); eingestellt sind 250, weil das unberührte Panel nahe 0 liest (Sollte das nicht stimmen, macht sich das durch Punkte ohne Berührung bemerkbar, dann hochsetzen) |
-| RGB-LED leuchtet nur grün | Ist im Betrieb so gewollt (grün = läuft, blau = Neuzeichnen). Ob alle drei Kanäle funktionieren, zeigt der Selbsttest direkt nach dem Start: rot, grün, blau, weiß nacheinander. Fehlt eine Farbe dort, stimmt der Pin nicht (`BOARD_LED_PIN_*`; andere CYD-Revisionen nutzen GPIO4 für rot) oder die LED/der Vorwiderstand ist defekt |
+| RGB-LED macht im Betrieb nichts | Modus prüfen: `status LED: white, dimmed` heißt 30 % PWM – das ist bei Tageslicht am Rückwand-Abstrahl kaum zu sehen. Zum Testen `STATUSLED_IDLE_BRIGHTNESS` in [statusled.h](main/statusled.h) auf 100 setzen |
+| RGB-LED zeigt keine Farben / nur eine Farbe | Der Selbsttest direkt nach dem Start (rot, grün, blau, weiß) zeigt, ob alle drei Kanäle funktionieren. Fehlt eine Farbe dort, stimmt der Pin nicht (`BOARD_LED_PIN_*`; andere CYD-Revisionen nutzen GPIO4 für rot) oder LED/Vorwiderstand ist defekt |
 
 ### Touch-Kalibrierung
 
@@ -545,14 +828,23 @@ Abhängigkeiten selbst nach. `sdkconfig.defaults` wirkt nur bei neu erzeugter
 4. ~~Hochformat + Testbild ausgelagert~~ – erledigt: `testscreen.c`, Anzeige 240×320
 5. ~~JPEG-Anzeige~~ – erledigt: `wallpaper.c`, `ocean-sunset.jpg` wird dekodiert
 6. ~~Temperatur im Großformat~~ – erledigt: `bigdigit.c`, Kachel x 25…215 / y 25…175
-7. Luftfeuchte `xx,x %rF` in der zweiten Glasfläche (halb so große Schrift)
-8. NTP-Zeit über WLAN holen (`esp_sntp`), Zeitzone Europe/Berlin, Uhrzeit/Datum-Block
-9. Bildauswahl automatisch: Jahreszeit aus dem Monat, Tageszeit aus der Stunde
-   (Helfer `wallpaper_season_from_month()` / `wallpaper_daytime_from_hour()` sind
-   schon vorhanden), Zufall aus den drei Bildern per `wallpaper_random_index()`
-10. HTTP-Server mit JSON-Endpunkt für Temperatur/Luftfeuchte
-11. Feinschliff: beim Neuzeichnen nur die Werte-Kachel aktualisieren statt des
-    ganzen Frames (spart das JPEG-Dekodieren, aktuell 102 ms pro Frame)
+7. ~~Luftfeuchte, Luftdruck, Datum/Zeit in der unteren Glasfläche~~ – erledigt:
+   `infotile.c`, drei zentrierte Zeilen im Bereich x 25…214 / y 205…294
+8. ~~WLAN + NTP~~ – erledigt: `wifi.c`, `clock.c`, Konfiguration in
+   `connect.h`, Zeitzone Europe/Berlin, SNTP im Hintergrund; bis zur ersten
+   Antwort zeigen die Zeilen `APP_FALLBACK_*` aus [main/main.c](main/main.c)
+9. ~~Sonnenauf-/-untergang von sunrise-sunset.org~~ – erledigt: `sun.c` holt die
+   Werte per HTTPS, rechnet sie in Ortszeit um und legt sie in `clock.c` ab
+   (`clock_sunrise()` / `clock_sunset()`), Auffrischung alle 6 h
+10. ~~Bildauswahl automatisch~~ – erledigt: `wallpaper_daytime_for()` (Sonnenaufgang,
+    09:00 bzw. 10:00 im Winter, Sonnenuntergang, 23:00) und
+    `wallpaper_season_from_month()`; beim Slot-Wechsel wird eines der drei Bilder
+    zufällig gewählt. Regeln und Zeiten stehen als `WALLPAPER_*` in
+    [main/wallpaper.h](main/wallpaper.h) –    die Sonnenzeiten können dabei die Grenze zwischen Tag und Nacht genauer ziehen
+    als feste Stunden
+11. HTTP-Server mit JSON-Endpunkt für Temperatur/Luftfeuchte
+12. Feinschliff: nur das betroffene Band neu zeichnen statt beider (das
+    JPEG-Dekodieren von ~110 ms pro Band bliebe allerdings)
 
 Optional, nicht für das Raumthermometer nötig:
 

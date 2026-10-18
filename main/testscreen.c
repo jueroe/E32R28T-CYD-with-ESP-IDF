@@ -64,37 +64,56 @@ static void draw_test_pattern(gfx_canvas_t *canvas)
     gfx_fill_rect(canvas, 0, ROW_STATUS_Y, BOARD_SCREEN_WIDTH, ROW_STATUS_H, GFX_DARK_GRAY);
 }
 
-void testscreen_draw(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel)
-{
-    draw_test_pattern(canvas);
-    gfx_flush_all(canvas, panel);
-}
-
-static void draw_status(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel,
-                        const char *line2, const char *line3, int sweep)
+/* Numbers of the status block, drawn at absolute screen coordinates and
+ * clipped to whichever band is being painted */
+static void draw_status(gfx_canvas_t *canvas, const char *line2, const char *line3, int sweep)
 {
     const uint16_t background = GFX_DARK_GRAY;
 
+    gfx_fill_rect(canvas, 0, ROW_STATUS_Y, BOARD_SCREEN_WIDTH, ROW_STATUS_H, background);
     gfx_text(canvas, 4, ROW_STATUS_Y + 3, line2, GFX_WHITE, background, 1, true);
-
-    /* clear the whole row first, the touch line changes length */
-    gfx_fill_rect(canvas, 0, ROW_STATUS_Y + 14, BOARD_SCREEN_WIDTH, 8, background);
     gfx_text(canvas, 4, ROW_STATUS_Y + 14, line3, GFX_WHITE, background, 1, false);
 
     /* sweeping bar */
-    gfx_fill_rect(canvas, 0, ROW_STATUS_Y + 26, BOARD_SCREEN_WIDTH, 10, background);
     const int sweep_width = BOARD_SCREEN_WIDTH / 6;
     const int sweep_x = sweep * (BOARD_SCREEN_WIDTH - sweep_width) / 99;
     gfx_fill_rect(canvas, sweep_x, ROW_STATUS_Y + 26, sweep_width, 10, GFX_GREEN);
     gfx_rect_outline(canvas, 0, ROW_STATUS_Y + 26, BOARD_SCREEN_WIDTH, 10, GFX_WHITE);
+}
 
-    gfx_flush(canvas, panel, 0, ROW_STATUS_Y, BOARD_SCREEN_WIDTH, ROW_STATUS_H);
+/* Paint one band: test pattern, the last touch point and the status block */
+static void draw_band(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel, int band_y,
+                      const touch_state_t *dot, const char *line2, const char *line3, int sweep)
+{
+    gfx_canvas_set_origin(canvas, band_y);
+    draw_test_pattern(canvas);
+
+    if (dot != NULL && dot->pressed) {
+        gfx_circle_filled(canvas, dot->x, dot->y, 5, GFX_MAGENTA);
+        gfx_circle_filled(canvas, dot->x, dot->y, 2, GFX_WHITE);
+    }
+
+    draw_status(canvas, line2, line3, sweep);
+    gfx_flush_all(canvas, panel);
+}
+
+/* Repaint the whole screen, band by band */
+static void redraw_all(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel, const touch_state_t *dot,
+                       const char *line2, const char *line3, int sweep)
+{
+    for (int band_y = 0; band_y < BOARD_SCREEN_HEIGHT; band_y += canvas->height) {
+        draw_band(canvas, panel, band_y, dot, line2, line3, sweep);
+    }
+    gfx_canvas_set_origin(canvas, 0);
+}
+
+void testscreen_draw(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel)
+{
+    redraw_all(canvas, panel, NULL, "", "", 0);
 }
 
 void testscreen_run(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel)
 {
-    testscreen_draw(canvas, panel);
-
     char touch_line[48];
     snprintf(touch_line, sizeof(touch_line), "TOUCH: %s", touch_is_available() ? "READY" : "NOT AVAILABLE");
 
@@ -103,18 +122,17 @@ void testscreen_run(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel)
     int64_t last_touch_log_us = 0;
     int frames = 0;
     int fps = 0;
+    touch_state_t last_touch = {0};
 
     for (;;) {
         const int64_t now_us = esp_timer_get_time();
         const int64_t uptime_us = now_us - start_us;
         const int sweep = (int)((uptime_us / 50000) % 100); /* 0..99, 5 s per cycle */
 
-        /* touch: paint a dot and follow it in the status line */
+        /* touch: remember the point and follow it in the status line */
         touch_state_t touch = {0};
         if (touch_is_available() && touch_read(&touch) == ESP_OK && touch.pressed) {
-            gfx_circle_filled(canvas, touch.x, touch.y, 5, GFX_MAGENTA);
-            gfx_circle_filled(canvas, touch.x, touch.y, 2, GFX_WHITE);
-            gfx_flush(canvas, panel, touch.x - 6, touch.y - 6, 13, 13);
+            last_touch = touch;
 
             snprintf(touch_line, sizeof(touch_line), "TOUCH: RAW %4u/%4u -> %3d/%3d  Z%4u",
                      touch.raw_x, touch.raw_y, touch.x, touch.y, touch.strength);
@@ -128,7 +146,7 @@ void testscreen_run(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel)
         snprintf(line2, sizeof(line2), "UPTIME %5d.%1ds  FPS %2d  HEAP %4d KB",
                  (int)(uptime_us / 1000000), (int)((uptime_us / 100000) % 10), fps,
                  (int)(heap_caps_get_free_size(MALLOC_CAP_DEFAULT) / 1024));
-        draw_status(canvas, panel, line2, touch_line, sweep);
+        redraw_all(canvas, panel, &last_touch, line2, touch_line, sweep);
 
         /* BOOT key redraws the clean test pattern */
         if (gpio_get_level(BOARD_PIN_BOOT) == 0) {

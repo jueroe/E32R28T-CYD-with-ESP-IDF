@@ -11,6 +11,9 @@ dependencies.lock
 .vscode/launch.json
 .vscode/settings.json.bak
 
+# Site configuration with the WiFi password - connect.example.h is the template
+main/connect.h
+
 # Python
 __pycache__/
 *.pyc

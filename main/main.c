@@ -30,33 +30,42 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
+#include "esp_sntp.h"
 #include "esp_timer.h"
 
 #include "background.h"
 #include "bigdigit.h"
 #include "board_e32r28t.h"
+#include "clock.h"
+#include "connect.h"
 #include "gfx.h"
+#include "infotile.h"
 #include "layout.h"
 #include "sensor.h"
 #include "statusled.h"
 #include "storage.h"
+#include "sun.h"
 #include "testscreen.h"
 #include "touch.h"
 #include "ttf.h"
 #include "wallpaper.h"
+#include "wifi.h"
 
 static const char *TAG = "cyd";
 
 /* 1 = hardware test screen instead of the thermometer readout */
 #define APP_SHOW_TESTSCREEN 0
 
-/* Wallpaper slot shown for now; later derived from the NTP date and time */
-#define APP_SEASON           SEASON_SUMMER
-#define APP_DAYTIME          DAYTIME_EVENING
-#define APP_BACKGROUND_INDEX 1 /* ocean-sunset.jpg */
-
-/* Seconds between sensor reads (a thermometer does not need more) */
+/* The wallpaper slot now follows season and time of day, see wallpaper.h.
+ * Seconds between sensor reads (a thermometer does not need more) */
 #define SENSOR_INTERVAL_S 10
+
+/* Shown in the info tile as long as the NTP clock has no time yet: 01.01. 00:00
+ * (the year is not part of the line, the tile shows dd.mm. hh:mm) */
+#define APP_FALLBACK_DAY     1
+#define APP_FALLBACK_MONTH   1
+#define APP_FALLBACK_HOUR    0
+#define APP_FALLBACK_MINUTE  0
 
 static esp_lcd_panel_handle_t s_panel;
 static gfx_canvas_t s_canvas;
@@ -199,25 +208,150 @@ static void boot_button_init(void)
 /* ------------------------------------------------------------------------- */
 
 static int s_shown_tenths;
+static int s_shown_humidity_tenths;
+static int s_shown_pressure_whole;
+static int s_shown_clock;
 
-/* Draw wallpaper and the temperature tile, then send the frame to the panel. */
-static esp_err_t draw_thermometer(const char *path, int tenths, uint16_t text_color)
+/* How many bands still report their text pixel count at boot (diagnostics) */
+static int s_text_log_budget = 6;
+
+/* Current date and time for the display, with the fallback while NTP has not
+ * answered yet */
+static void shown_time(int *day, int *month, int *hour, int *minute)
+{
+    struct tm now;
+    if (clock_local_now(&now)) {
+        *day = now.tm_mday;
+        *month = now.tm_mon + 1;
+        *hour = now.tm_hour;
+        *minute = now.tm_min;
+    } else {
+        *day = APP_FALLBACK_DAY;
+        *month = APP_FALLBACK_MONTH;
+        *hour = APP_FALLBACK_HOUR;
+        *minute = APP_FALLBACK_MINUTE;
+    }
+}
+
+/* Fill the info tile values from a sensor reading plus the current time. */
+static void info_values_from(const sensor_reading_t *reading, infotile_values_t *info)
+{
+    info->humidity_rh = reading->humidity_rh;
+    info->pressure_hpa = reading->pressure_hpa;
+    shown_time(&info->day, &info->month, &info->hour, &info->minute);
+}
+
+/* Comparable number of the displayed date/time, so a redraw happens exactly
+ * when the minute changes */
+static int clock_key(const infotile_values_t *info)
+{
+    return ((info->month * 32 + info->day) * 24 + info->hour) * 60 + info->minute;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Wallpaper slot: season and time of day, one of three images picked at       */
+/* random whenever the slot changes (rules in wallpaper.h)                     */
+/* ------------------------------------------------------------------------- */
+
+static season_t s_season;
+static daytime_t s_daytime;
+static int s_wallpaper_index;
+static char s_wallpaper_path[128];
+static uint16_t s_text_color;
+static bool s_wallpaper_valid;
+
+/* Pick a new wallpaper if season or time of day changed.
+ * Returns true when the slot changed, so the caller has to redraw. */
+static bool wallpaper_update(void)
+{
+    int day = 0;
+    int month = 0;
+    int hour = 0;
+    int minute = 0;
+    shown_time(&day, &month, &hour, &minute);
+
+    const season_t season = wallpaper_season_from_month(month);
+    const daytime_t daytime = wallpaper_daytime_for(month, hour, minute);
+    if (s_wallpaper_valid && season == s_season && daytime == s_daytime) {
+        return false;
+    }
+
+    s_season = season;
+    s_daytime = daytime;
+    s_wallpaper_index = wallpaper_random_index();
+    s_text_color = backgrounds[season][daytime][s_wallpaper_index].textcolor;
+    wallpaper_slot_path(s_wallpaper_path, sizeof(s_wallpaper_path), season, daytime,
+                        s_wallpaper_index);
+    s_wallpaper_valid = true;
+
+    ESP_LOGI(TAG, "background %d/%d/%d at %02d.%02d. %02d:%02d: %s, text colour 0x%04X",
+             season, daytime, s_wallpaper_index, day, month, hour, minute, s_wallpaper_path,
+             s_text_color);
+
+    /* the status LED doubles as ambilight: rainbow fade at night, dimmed white
+     * during the day (see statusled.h) */
+    const bool night = (daytime == DAYTIME_NIGHT);
+    statusled_ambilight(night);
+    ESP_LOGI(TAG, "status LED: %s", night ? "rainbow fade (night)" : "white, dimmed");
+    return true;
+}
+
+/* stb_truetype can fail silently when a temporary buffer does not fit (see the
+ * note in stb_truetype.h), so every band is checked for text pixels afterwards:
+ * a frame without any would show an empty readout. */
+static uint32_t count_text_pixels(const gfx_canvas_t *canvas, uint16_t text_color)
+{
+    uint32_t count = 0;
+    const size_t pixels = (size_t)canvas->width * canvas->height;
+    for (size_t i = 0; i < pixels; i++) {
+        if (canvas->pixels[i] == text_color) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Draw wallpaper and the tiles band by band, sending each band to the panel. */
+static esp_err_t draw_thermometer(int tenths, const infotile_values_t *info)
 {
     const int64_t start_us = esp_timer_get_time();
-    const esp_err_t err = wallpaper_load(&s_canvas, path);
+    const esp_err_t err = wallpaper_decode(s_wallpaper_path);
     if (err != ESP_OK) {
         return err;
     }
     const int64_t decoded_us = esp_timer_get_time();
 
-    const int used = bigdigit_draw_number(&s_canvas, LAYOUT_TEMP_X, LAYOUT_TEMP_BASELINE_Y,
-                                          LAYOUT_TEMP_MAX_WIDTH, tenths, text_color);
-    bigdigit_draw_degree(&s_canvas, LAYOUT_TEMP_DEGREE_X, LAYOUT_TEMP_DEGREE_Y,
-                         LAYOUT_TEMP_DIGIT_HEIGHT, text_color);
-    const esp_err_t flush_err = gfx_flush_all(&s_canvas, s_panel);
-    if (flush_err != ESP_OK) {
-        return flush_err;
+    int used = 0;
+    for (int band_y = 0; band_y < BOARD_SCREEN_HEIGHT; band_y += LAYOUT_BAND_HEIGHT) {
+        gfx_canvas_set_origin(&s_canvas, band_y);
+        const esp_err_t paint_err = wallpaper_paint(&s_canvas, band_y, LAYOUT_BAND_HEIGHT);
+        if (paint_err != ESP_OK) {
+            gfx_canvas_set_origin(&s_canvas, 0);
+            return paint_err;
+        }
+
+        used = bigdigit_draw_number(&s_canvas, LAYOUT_TEMP_X, LAYOUT_TEMP_BASELINE_Y,
+                                    LAYOUT_TEMP_MAX_WIDTH, tenths, s_text_color);
+        bigdigit_draw_degree(&s_canvas, LAYOUT_TEMP_DEGREE_X, LAYOUT_TEMP_DEGREE_Y,
+                             LAYOUT_TEMP_DIGIT_HEIGHT, s_text_color);
+        infotile_draw(&s_canvas, info, s_text_color);
+
+        const uint32_t text_pixels = count_text_pixels(&s_canvas, s_text_color);
+        if (text_pixels == 0) {
+            ESP_LOGE(TAG, "band %d..%d has no text pixels - the readout stays empty", band_y,
+                     band_y + LAYOUT_BAND_HEIGHT - 1);
+        } else if (s_text_log_budget > 0) {
+            s_text_log_budget--;
+            ESP_LOGI(TAG, "band %d..%d: %u text pixels", band_y, band_y + LAYOUT_BAND_HEIGHT - 1,
+                     (unsigned)text_pixels);
+        }
+
+        const esp_err_t flush_err = gfx_flush_all(&s_canvas, s_panel);
+        if (flush_err != ESP_OK) {
+            return flush_err;
+        }
     }
+    gfx_canvas_set_origin(&s_canvas, 0);
 
     ESP_LOGI(TAG, "frame: %d,%d degC, text from (%d,%d), %d px wide, degree at (%d,%d), decode %lld ms, total %lld ms",
              tenths / 10, tenths % 10, LAYOUT_TEMP_X, LAYOUT_TEMP_BASELINE_Y, used,
@@ -229,41 +363,63 @@ static esp_err_t draw_thermometer(const char *path, int tenths, uint16_t text_co
 
 static void thermometer_task(void)
 {
-    char path[128];
-    wallpaper_slot_path(path, sizeof(path), APP_SEASON, APP_DAYTIME, APP_BACKGROUND_INDEX);
-    const uint16_t text_color = backgrounds[APP_SEASON][APP_DAYTIME][APP_BACKGROUND_INDEX].textcolor;
-    ESP_LOGI(TAG, "wallpaper slot %d/%d/%d: %s, text colour 0x%04X", APP_SEASON, APP_DAYTIME,
-             APP_BACKGROUND_INDEX, path, text_color);
+    sensor_reading_t reading = {0};
+    infotile_values_t info;
 
-    sensor_reading_t reading;
-    if (sensor_is_available() && sensor_read(&reading) == ESP_OK) {
-        s_shown_tenths = (int)lroundf(reading.temperature_c * 10.0f);
-    } else {
+    /* season and time of day decide the slot, the image is picked at random */
+    wallpaper_update();
+
+    if (!sensor_is_available() || sensor_read(&reading) != ESP_OK) {
         ESP_LOGW(TAG, "no sensor reading yet, showing 00,0");
-        s_shown_tenths = 0;
     }
+    s_shown_tenths = (int)lroundf(reading.temperature_c * 10.0f);
+    s_shown_humidity_tenths = (int)lroundf(reading.humidity_rh * 10.0f);
+    s_shown_pressure_whole = (int)lroundf(reading.pressure_hpa);
+    info_values_from(&reading, &info);
+    s_shown_clock = clock_key(&info);
 
-    if (draw_thermometer(path, s_shown_tenths, text_color) != ESP_OK) {
+    if (draw_thermometer(s_shown_tenths, &info) != ESP_OK) {
         ESP_LOGE(TAG, "could not draw the thermometer screen");
     }
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_S * 1000));
 
+        /* the clock runs on its own, so refresh it even when the sensor fails;
+         * a new background has to be drawn in any case */
+        bool redraw = wallpaper_update();
+        info_values_from(&reading, &info);
+        const int clock_now = clock_key(&info);
+
         if (!sensor_is_available() || sensor_read(&reading) != ESP_OK) {
             ESP_LOGW(TAG, "sensor read failed");
+            if (redraw || clock_now != s_shown_clock) {
+                s_shown_clock = clock_now;
+                if (draw_thermometer(s_shown_tenths, &info) != ESP_OK) {
+                    ESP_LOGW(TAG, "redraw failed");
+                }
+            }
             continue;
         }
 
+        char stamp[32];
         const int tenths = (int)lroundf(reading.temperature_c * 10.0f);
-        ESP_LOGI(TAG, "BME280: %.2f C, %.1f %%rH, %.1f hPa", reading.temperature_c,
-                 reading.humidity_rh, reading.pressure_hpa);
+        ESP_LOGI(TAG, "%s BME280: %.2f C, %.1f %%rH, %.1f hPa, IP %s",
+                 clock_format(stamp, sizeof(stamp)), reading.temperature_c, reading.humidity_rh,
+                 reading.pressure_hpa, wifi_ip_address());
 
-        if (tenths == s_shown_tenths) {
+        const int humidity_tenths = (int)lroundf(reading.humidity_rh * 10.0f);
+        const int pressure_whole = (int)lroundf(reading.pressure_hpa);
+        if (!redraw && tenths == s_shown_tenths && humidity_tenths == s_shown_humidity_tenths &&
+            pressure_whole == s_shown_pressure_whole && clock_now == s_shown_clock) {
             continue;
         }
         s_shown_tenths = tenths;
-        if (draw_thermometer(path, tenths, text_color) != ESP_OK) {
+        s_shown_humidity_tenths = humidity_tenths;
+        s_shown_pressure_whole = pressure_whole;
+        s_shown_clock = clock_now;
+        info_values_from(&reading, &info);
+        if (draw_thermometer(tenths, &info) != ESP_OK) {
             ESP_LOGW(TAG, "redraw failed");
         }
     }
@@ -272,6 +428,42 @@ static void thermometer_task(void)
 /* ------------------------------------------------------------------------- */
 /* Application                                                               */
 /* ------------------------------------------------------------------------- */
+
+/* Network comes up in the background: the readout starts immediately with the
+ * fallback date and picks up the real time as soon as NTP answered. */
+static void network_task(void *argument)
+{
+    (void)argument;
+
+    if (!wifi_connect(CONNECT_WIFI_TIMEOUT_MS)) {
+        ESP_LOGW(TAG, "no network - date and time keep the fallback values");
+        vTaskDelete(NULL);
+        return;
+    }
+    wifi_log_link();
+    clock_start_sntp();
+    if (!clock_wait_for_sync(CONNECT_SNTP_WAIT_MS)) {
+        /* the first query can get lost on a busy network; without a retry the
+         * clock would stay at 1970 for the next poll interval (1 h) */
+        for (int attempt = 0; attempt < 3; attempt++) {
+            ESP_LOGW(TAG, "retrying the NTP query (%d/3)", attempt + 1);
+            esp_sntp_restart();
+            if (clock_wait_for_sync(CONNECT_SNTP_WAIT_MS)) {
+                break;
+            }
+        }
+    }
+    clock_log_now();
+
+    /* HTTPS needs the correct date for the certificate check, so the sun times
+     * are fetched after the NTP sync and then refreshed every few hours */
+    for (;;) {
+        if (sun_fetch() != ESP_OK) {
+            ESP_LOGW(TAG, "sun times not updated, retrying in %d s", CONNECT_SUN_REFRESH_S);
+        }
+        vTaskDelay(pdMS_TO_TICKS(CONNECT_SUN_REFRESH_S * 1000));
+    }
+}
 
 void app_main(void)
 {
@@ -284,6 +476,7 @@ void app_main(void)
     backlight_set(0);
     statusled_init();
     statusled_self_test();
+    statusled_start();
     boot_button_init();
 
     if (lcd_init() != ESP_OK) {
@@ -291,8 +484,9 @@ void app_main(void)
         return;
     }
 
-    if (gfx_canvas_init(&s_canvas, BOARD_SCREEN_WIDTH, BOARD_SCREEN_HEIGHT) != ESP_OK) {
-        ESP_LOGE(TAG, "not enough memory for the %dx%d canvas", BOARD_SCREEN_WIDTH, BOARD_SCREEN_HEIGHT);
+    if (gfx_canvas_init(&s_canvas, BOARD_SCREEN_WIDTH, LAYOUT_BAND_HEIGHT) != ESP_OK) {
+        ESP_LOGE(TAG, "not enough memory for the %dx%d band canvas", BOARD_SCREEN_WIDTH,
+                 LAYOUT_BAND_HEIGHT);
         return;
     }
 
@@ -314,15 +508,20 @@ void app_main(void)
         ESP_LOGE(TAG, "font could not be loaded, the readout stays empty");
     }
 
+    /* Time zone first: the clock shows the local time as soon as NTP answers */
+    clock_init();
+
+    if (xTaskCreate(network_task, "network", 8192, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "no memory for the network task - no WiFi and no NTP");
+    }
+
     ESP_LOGI(TAG, "%d free heap bytes after initialisation", (int)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
 
 #if APP_SHOW_TESTSCREEN
     backlight_set(100);
-    statusled_set(false, true, false);
     testscreen_run(&s_canvas, s_panel); /* never returns */
 #endif
 
     backlight_set(100);
-    statusled_set(false, true, false);
     thermometer_task(); /* never returns */
 }

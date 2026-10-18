@@ -27,3 +27,34 @@ CONFIG_LITTLEFS_OBJ_NAME_LEN=128
 # near 0, so 250 keeps a good margin on both sides.  Keep this in sync with
 # BOARD_TOUCH_Z_THRESHOLD in main/board_e32r28t.h.
 CONFIG_XPT2046_Z_THRESHOLD=250
+
+# WiFi buffers live in static RAM and every kilobyte counts here: the 240x320
+# framebuffer needs 150 KB in one piece, and the WiFi stack alone takes ~30 KB
+# of the 192 KB DRAM segment.  A thermometer needs neither an access point of
+# its own nor WPA3-Enterprise, so those features stay out of the build.
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
+
+# Fewer static RX buffers (default 10, ~1.6 KB each) and no NTP-scale traffic;
+# the dynamic buffers take over when more frames arrive.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=2
+
+# Keep the WiFi code in flash instead of IRAM.  Costs a little throughput,
+# frees ~27 KB of IRAM which the heap can use for the network stack.
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
+# HTTPS for the sunrise-sunset request needs the default 16 KB TLS record
+# buffer: the certificate chain of the server arrives as one record and does not
+# fit into a smaller buffer (the handshake fails with a fatal error).
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+
+# api.sunrise-sunset.org presents its root "GTS Root R4" in the cross-signed
+# variant (signed by GlobalSign Root CA, which is not in the bundle).  Without
+# this option the ESP32 gives up with "No matching trusted root certificate
+# found"; with it, mbedtls matches the cross-signed root against the bundle's
+# self-signed GTS Root R4.  Costs ~700 bytes of heap.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y

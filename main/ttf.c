@@ -1,17 +1,42 @@
-#include "ttf.h"
+﻿#include "ttf.h"
 
 #include <string.h>
 
-#include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+
+static const char *TAG = "ttf";
+
+/* stb_truetype takes its temporary buffers (glyph vertices, flattened points,
+ * edges, bitmap) from the heap.  A failed allocation inside the library is
+ * silent - the glyph simply stays empty, which looked like "the texts vanished"
+ * on the display after WiFi and TLS had fragmented the heap.  The chunk sizes
+ * in stb_truetype.h are reduced for that reason (see the note at the top of the
+ * file), and this wrapper reports anything that still does not fit. */
+static void *ttf_alloc(size_t size);
+static void ttf_free(void *pointer);
 
 #define STB_TRUETYPE_IMPLEMENTATION
-#define STBTT_malloc(size, user) heap_caps_malloc(size, MALLOC_CAP_8BIT)
-#define STBTT_free(ptr, user) heap_caps_free(ptr)
+#define STBTT_malloc(size, user) ttf_alloc(size)
+#define STBTT_free(ptr, user) ttf_free(ptr)
 #define STBTT_assert(x) ((void)0)
 #include "stb_truetype.h"
 
-static const char *TAG = "ttf";
+static void *ttf_alloc(size_t size)
+{
+    void *pointer = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    if (pointer == NULL) {
+        ESP_LOGE(TAG, "no memory for %u bytes (free %d, largest %d)", (unsigned)size,
+                 (int)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                 (int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    }
+    return pointer;
+}
+
+static void ttf_free(void *pointer)
+{
+    heap_caps_free(pointer);
+}
 
 /* Font built into the firmware, see EMBED_FILES in CMakeLists.txt */
 extern const uint8_t _binary_OpenSans_Regular_ttf_start[] asm("_binary_OpenSans_Regular_ttf_start");
@@ -19,7 +44,6 @@ extern const uint8_t _binary_OpenSans_Regular_ttf_end[] asm("_binary_OpenSans_Re
 
 static stbtt_fontinfo s_font;
 static bool s_ready;
-
 esp_err_t ttf_init(const void *data, size_t size)
 {
     if (data == NULL || size < 256) {
@@ -177,6 +201,20 @@ void ttf_draw_text(gfx_canvas_t *canvas, int x, int baseline_y, const char *utf8
         return;
     }
 
+    /* When the screen is drawn in bands, skip whole strings that lie outside
+     * the current one - rasterising glyphs is the expensive part. */
+    int ink_x0 = 0;
+    int ink_y0 = 0;
+    int ink_x1 = 0;
+    int ink_y1 = 0;
+    if (ttf_text_ink_box(utf8, scale_x, scale_y, &ink_x0, &ink_y0, &ink_x1, &ink_y1)) {
+        const int top = baseline_y + ink_y0;
+        const int bottom = baseline_y + ink_y1;
+        if (bottom < canvas->origin_y || top >= canvas->origin_y + canvas->height) {
+            return;
+        }
+    }
+
     int pen_x = x;
     const char *cursor = utf8;
 
@@ -204,4 +242,35 @@ void ttf_draw_text(gfx_canvas_t *canvas, int x, int baseline_y, const char *utf8
         }
         pen_x += (int)((float)advance * scale_x);
     }
+}
+
+int ttf_draw_text_centered(gfx_canvas_t *canvas, int center_x, int baseline_y, const char *utf8,
+                           int cap_height, int max_width, float min_squeeze, uint16_t color)
+{
+    if (!s_ready || utf8 == NULL || cap_height <= 0 || max_width <= 0) {
+        return 0;
+    }
+
+    const float scale_y = ttf_scale_for_cap_height(cap_height);
+    float scale_x = scale_y;
+    int width = ttf_text_width(utf8, scale_x, scale_y);
+
+    if (width > max_width) {
+        const float squeeze = (float)max_width / (float)width;
+        if (squeeze < min_squeeze) {
+            /* shorter text instead of an unreadable squeeze */
+            const int shorter = (int)((float)cap_height * squeeze / min_squeeze);
+            const float shorter_scale = ttf_scale_for_cap_height(shorter);
+            scale_x = shorter_scale * min_squeeze;
+            width = ttf_text_width(utf8, scale_x, shorter_scale);
+            ttf_draw_text(canvas, center_x - width / 2, baseline_y, utf8, scale_x, shorter_scale,
+                          color);
+            return width;
+        }
+        scale_x = scale_y * squeeze;
+        width = ttf_text_width(utf8, scale_x, scale_y);
+    }
+
+    ttf_draw_text(canvas, center_x - width / 2, baseline_y, utf8, scale_x, scale_y, color);
+    return width;
 }

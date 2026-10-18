@@ -1,4 +1,4 @@
-/*
+﻿/*
  * TrueType text rendering on the canvas.
  *
  * stb_truetype rasterises glyphs with anti-aliasing at any size and with
@@ -53,3 +53,14 @@ void ttf_draw_text(gfx_canvas_t *canvas, int x, int baseline_y, const char *utf8
  */
 bool ttf_text_ink_box(const char *utf8, float scale_x, float scale_y,
                       int *x0, int *y0, int *x1, int *y1);
+
+/**
+ * Draw `utf8` horizontally centred around `center_x`, standing on `baseline_y`.
+ *
+ * The text is scaled to `cap_height` and condensed if it would be wider than
+ * `max_width`, but never below `min_squeeze` (1.0 = never condense).
+ *
+ * @return width actually used in pixels
+ */
+int ttf_draw_text_centered(gfx_canvas_t *canvas, int center_x, int baseline_y, const char *utf8,
+                           int cap_height, int max_width, float min_squeeze, uint16_t color);

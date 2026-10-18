@@ -59,8 +59,10 @@ void bigdigit_draw_degree(gfx_canvas_t *canvas, int right_x, int top_y, int digi
      * (right_x - x1, top_y - y0) */
     ttf_draw_text(canvas, right_x - x1, top_y - y0, DEGREE_SIGN, scale, scale, color);
 
-    ESP_LOGI(TAG, "degree: %dx%d px ink, top right corner at (%d,%d)", x1 - x0, y1 - y0, right_x,
-             top_y);
+    if (gfx_canvas_is_first_band(canvas)) {
+        ESP_LOGI(TAG, "degree: %dx%d px ink, top right corner at (%d,%d)", x1 - x0, y1 - y0,
+                 right_x, top_y);
+    }
 }
 
 int bigdigit_draw_number(gfx_canvas_t *canvas, int x, int baseline_y, int max_width, int tenths,
@@ -122,8 +124,10 @@ int bigdigit_draw_number(gfx_canvas_t *canvas, int x, int baseline_y, int max_wi
     pen_x += ttf_text_width(decimal_text, small_scale_x, small_scale_y);
 
     const int used = pen_x - x;
-    ESP_LOGI(TAG, "\"%s,%s\" cap %d px, scale x/y %.3f/%.3f, from x=%d on baseline y=%d, %d px wide",
-             big_digits, decimal_text, cap_height, scale_x, scale_y, x, baseline_y, used);
+    if (gfx_canvas_is_first_band(canvas)) {
+        ESP_LOGI(TAG, "\"%s,%s\" cap %d px, scale x/y %.3f/%.3f, from x=%d on baseline y=%d, %d px wide",
+                 big_digits, decimal_text, cap_height, scale_x, scale_y, x, baseline_y, used);
+    }
 
     return used;
 }
