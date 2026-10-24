@@ -285,17 +285,23 @@ einen Abend gekostet.
 
 ## 7. Diese Datei im Chat nutzen
 
-Im neuen Projekt-Chat genügt ein Verweis, z. B.:
+Die folgenden Zitate sind **Textbausteine zum Kopieren**, keine Statusberichte:
+sie zeigen, was du im neuen Chat schreiben könntest. Das neue Projekt muss
+dafür natürlich schon existieren (`New-Item` bzw. die ESP-IDF-Vorlage) und
+`data\backgrounds` schon kopiert sein.
+
+Für den Außensensor:
 
 > Lies `C:\Users\joe\Documents\ESP-IDF\Projects\E32R28T_erste_Tests\PORTING.md`
 > und lege danach das Projekt für den SHT31-Außensensor an.
 
-Oder für das neue Display:
+Für das neue Display:
 
 > Lies `C:\Users\joe\Documents\ESP-IDF\Projects\E32R28T_erste_Tests\PORTING.md`,
-> Abschnitt 4 (ES3C28). Das neue Projekt liegt in `…\ES3C28_Thermometer`,
+> Abschnitt 3 (ES3C28). Das neue Projekt liegt in `…\ES3C28_Thermometer`,
 > `data\backgrounds` ist schon kopiert.
 
-Besser ist, `PORTING.md` und `.github/copilot-instructions.md` gleich in das neue
-Repository zu kopieren – dann liegen sie im Arbeitsverzeichnis und werden ohne
-Pfadangabe gefunden.
+Noch besser: `PORTING.md` und `.github/copilot-instructions.md` gleich in das neue
+Repository kopieren – dann liegen sie im Arbeitsverzeichnis und werden ohne
+Pfadangabe gefunden. Die zweite Datei wirkt sogar ohne jede Erwähnung, weil
+VS Code sie beim Chat-Start automatisch lädt.
