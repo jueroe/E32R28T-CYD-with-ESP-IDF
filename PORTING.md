@@ -1,10 +1,13 @@
 # PORTING – dieses Projekt als Vorlage für die nächsten
 
-Diese Datei ist für die zwei geplanten Folgeprojekte gedacht:
+Diese Datei ist für die geplanten Folgeprojekte gedacht:
 
 1. **Außensensor** – SHT31 an einem ESP32-C3 super mini, stellt Temperatur und
    Feuchte als HTTP/JSON bereit (Gegenstück zum Feld `remote` hier)
-2. **Wetterstation** – JC8012P4A1 mit ESP32-P4 + ESP32-C6-MINI-1U (32 MB PSRAM,
+2. **Zweites Raumgerät / ES3C28** – ESP32-S3 N16R8 (8 MB PSRAM, 16 MB Flash),
+   gleiches Panel (ILI9341V, 240×320), aber RGB666 und kapazitiver Touch
+   (FT6336G) – siehe Abschnitt 4
+3. **Wetterstation** – JC8012P4A1 mit ESP32-P4 + ESP32-C6-MINI-1U (32 MB PSRAM,
    16 MB Flash), zeigt die Werte aller Räume an
 
 Sie beschreibt, **was übernommen wird**, **was angepasst werden muss** und
@@ -65,7 +68,124 @@ Bandrendering nötig, kein RAM-Sparzwang wie auf dem E32R28T. Für den
 Konfigurationsmodus `CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y` **direkt in der
 `sdkconfig`** setzen (siehe Falle 3).
 
-## 3. Ziel B: Wetterstation (ESP32-P4 + ESP32-C6)
+## 3. Ziel B: ES3C28 (ESP32-S3 N16R8, RGB666, kapazitiver Touch)
+
+Gleiches Panel und gleiche Auflösung wie hier (ILI9341V, 240×320), aber ein
+anderer Prozessor, ein anderer Touch-Controller und ein anderes Farbformat. Die
+Anwendung selbst bleibt unverändert – betroffen sind nur die drei
+Hardware-Schichten.
+
+| Thema | E32R28T (hier) | ES3C28 | Aufwand |
+|---|---|---|---|
+| Prozessor | ESP32-D0WD-V3, 2 Kerne, 520 KB SRAM | ESP32-S3, 2 Kerne, 512 KB SRAM + 8 MB PSRAM | Board-Header |
+| Flash | 4 MB | 16 MB | `partitions.csv` |
+| Panel | ILI9341V, RGB565 | ILI9341V, **RGB666** | siehe unten |
+| Touch | XPT2046, resistiv, SPI | **FT6336G**, kapazitiv, I2C | `touch.c` ersetzen |
+| Anzeige-Puffer | 1 Band (77 KB), kein PSRAM | voller Frame möglich | `layout.h` |
+| Pins | siehe `board_e32r28t.h` | neues `board_es3c28.h` | Board-Header |
+
+### Was 1:1 übernommen wird
+
+`netcfg`, `configmode`, `webserver`, `discovery`, `textutil`, `watchdog`,
+`clock`, `sun`, `wallpaper`, `statusled` (Pins anpassen), `outdoor`, `infotile`,
+`bigdigit`, `ttf`, `tjpgd` – und `data/backgrounds` unverändert. Die
+Wallpaper-JPEGs sind formatunabhängig; nur das Ziel-Pixelformat entscheidet,
+wie sie in den Puffer geschrieben werden.
+
+### RGB666: ehrliche Einschätzung
+
+Das ILI9341 kann über SPI sowohl 16 Bit (RGB565) als auch 18 Bit (RGB666)
+annehmen. **RGB666 ist hier kein Selbstzweck:**
+
+* Der ganze Zeichenweg ist auf 16 Bit ausgelegt – `GFX_RGB565`,
+  `gfx_unpack565`, `gfx_blend_mask`, die Farbtabellen in `background.h`, und
+  TJpgDec liefert RGB565. Ein Umstieg auf 18 Bit heißt: 3 Bytes pro Pixel,
+  +50 % Buszeit, und jede dieser Stellen anfassen.
+* Sichtbarer Gewinn auf einem 240×320-TN-Panel ist gering – feinere Verläufe
+  bei Farb?bergängen, mehr nicht. Die Anti-Aliasing-Qualität der Schriften
+  hängt am Alphablending, nicht an der Farbtiefe.
+* **Empfehlung:** mit `bits_per_pixel = 16` starten (funktioniert sofort), und
+  erst wenn Verläufe sichtbar streifen, auf 18 umstellen. Der Panel-Treiber
+  (`esp_lcd_panel_ili9341`) nimmt beides.
+
+Falls 18 Bit doch gewünscht sind: nicht den ganzen Zeichenweg umbauen, sondern
+in `gfx_flush()` beim Kopieren ins DMA-Puffer von 565 auf 666 expandieren
+(3 Bytes statt 2). Damit bleiben Canvas, Blending und JPEG unverändert.
+
+### FT6336G statt XPT2046
+
+Der resistive Treiber hier (`esp_lcd_touch` + `atanisoft/esp_lcd_touch_xpt2046`)
+fällt weg. Zwei Wege:
+
+1. **Fertige Komponente** aus der Registry, die auf `espressif/esp_lcd_touch`
+   aufsetzt (Schnittstelle `esp_lcd_touch_read_data()` / `esp_lcd_touch_get_data()`
+   bleibt gleich): `cfscn/esp_lcd_touch_ft6x36` oder
+   `lambage/esp_lcd_touch_ft6336u`. Beide sind Community-Komponenten –
+   Qualität vorher am Log prüfen.
+2. **Eigener Treiber** in `touch.c` (empfohlen, wenn die Komponente nicht passt):
+   Der FT6336G hängt an I²C (Adresse 0x38), meldet die Zahl der Berührungen in
+   Register 0x02 und die erste Berührung ab 0x03 (X-High/Low, Y-High/Low). Das
+   sind ~100 Zeilen, und die bestehende Abstraktion (`touch_init`,
+   `touch_read`, `touch_state_t`) bleibt unverändert.
+
+Wichtig für den Rest des Programms:
+
+* **Keine Kalibrierung, keine Z-Schwelle.** `BOARD_TOUCH_RAW_MIN/MAX`,
+  `CONFIG_XPT2046_Z_THRESHOLD` und die `scale_axis()`-Umrechnung entfallen;
+  die Koordinaten kommen bereits in Bildschirmpixeln. `state->strength` auf
+  einen festen Wert setzen, damit die Prüfungen im Code weiter greifen.
+* `swap_xy` / `mirror_x` / `mirror_y` bleiben nötig – kapazitive Panels sind
+  häufig anders orientiert als das Display. Mit dem Log aus
+  `touch: XPT2046 ready …` (dort dann entsprechend) prüfen.
+* **Der Eck-Touch zum Öffnen der Einrichtung funktioniert weiter**
+  (`LAYOUT_CONFIG_HOLD_MS` 500 ms in `layout.h`). Bei kapazitivem Touch ist
+  ?halten" angenehmer als bei resistivem, weil kein Druck nötig ist.
+
+### PSRAM und der Anzeigepuffer
+
+Der S3 hat 512 KB internes SRAM – ein voller Frame (240×320×2 = 150 KB) passt
+dort hinein, ganz ohne PSRAM. Trotzdem **nicht** blind umstellen:
+
+* `LAYOUT_BAND_HEIGHT` auf `BOARD_SCREEN_HEIGHT` setzen und `origin_y` bleibt 0:
+  dann entfällt das Bandrendering, und TJpgDec dekodiert nur noch einmal statt
+  zweimal pro Frame (~30 ms gespart). Die Bandlogik bleibt als Option im Code.
+* Den Canvas **im internen RAM** halten (`MALLOC_CAP_DMA`), nicht in PSRAM:
+  SPI-DMA aus PSRAM funktioniert auf dem S3, ist aber langsamer und war schon
+  Gegenstand von Errata. PSRAM erst für Bilder-Caches oder Vorab-Dekodierung
+  nutzen.
+* Mit 8 MB PSRAM sind die Wallpaper-Sorgen weg: mehrere Bilder vorab dekodieren,
+  oder die littlefs-Partition von 1 MB auf 4 MB vergrößern (16 MB Flash).
+
+### Partitionen (16 MB)
+
+```
+nvs        24 KB
+otadata     8 KB      ← OTA ist bei 16 MB problemlos möglich
+phy_init    4 KB
+factory/ota_0  4 MB
+ota_1          4 MB
+storage     ~5 MB     littlefs mit allen Wallpapern
+```
+
+Wenn OTA nicht gebraucht wird, lieber eine große App-Partition und 8 MB
+littlefs. `CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y` nicht vergessen – und daran
+denken, dass `sdkconfig.defaults` nur bei fehlender `sdkconfig` wirkt (Falle 3).
+
+### Startreihenfolge beim Portieren
+
+1. Neues Projekt, `board_es3c28.h` mit den Pins, `partitions.csv`,
+   `sdkconfig.defaults` – **zuerst** `CONFIG_SPIRAM=y` und die Flash-Größe
+2. Panel zum Laufen bringen (`esp_lcd` + ILI9341, `bits_per_pixel = 16`),
+   Testbild aus `testscreen.c` zeigt, ob Pins und Orientierung stimmen
+3. Touch: erst rohe Koordinaten loggen, dann `swap`/`mirror` einstellen, dann
+   vier Ecken antippen (wie bei der ersten Inbetriebnahme hier)
+4. Erst danach die Anwendungsmodule kopieren – in der Reihenfolge
+   `netcfg` → `wifi` → `webserver` → `discovery`, damit das Gerät früh ohne
+   Neuflashen bedienbar ist
+5. `data/backgrounds` 1:1 übernehmen (die Dateinamen müssen zu
+   `background.h` passen – das ist die einzige Kopplung)
+
+## 4. Ziel C: Wetterstation (ESP32-P4 + ESP32-C6)
 
 Hier ändert sich die Netzwerkseite grundlegend, die Anzeigeseite wird einfacher.
 
@@ -93,7 +213,7 @@ Hier ändert sich die Netzwerkseite grundlegend, die Anzeigeseite wird einfacher
 
 ---
 
-## 4. Die schon bezahlten Fallen
+## 5. Die schon bezahlten Fallen
 
 Diese Liste ist der eigentliche Wert dieses Projekts – jede Zeile hat einmal
 einen Abend gekostet.
@@ -141,8 +261,19 @@ einen Abend gekostet.
 
 ---
 
-## 5. Checkliste für ein neues Projekt
+13. **`bits_per_pixel = 18` braucht auch 18-Bit-Daten.** Wer im Panel-Treiber auf
+    18 Bit stellt, aber 16-Bit-Pixel schickt, bekommt Farbmüll oder ein
+    verschobenes Bild. Format und Puffer müssen zusammenpassen.
+14. **Kapazitiver Touch liefert Koordinaten in Pixeln**, resistive Rohwerte. Wird
+    die Umrechnung (`scale_axis`) übernommen, landet der Finger im Eck.
+    Ebenso entfällt die Z-Schwelle – aber `strength` muss ein sinnvoller Wert
+    sein, sonst verwirft der Code jede Berührung.
 
+
+## 6. Checkliste für ein neues Projekt
+
+- [ ] Board-Datenblätter/Pinbelegung **vor** dem ersten Codezeile lesen, Pins in
+      `board_<name>.h` sammeln – beim ES3C28 zusätzlich `CONFIG_SPIRAM=y`
 - [ ] `sdkconfig.defaults` früh festlegen (Flash-Größe, Partitionen, CPU-Takt)
 - [ ] Pins in `board_<name>.h` sammeln, nichts hart im Code
 - [ ] `netcfg` + `webserver` + `discovery` zuerst – damit ist das Gerät ohne
@@ -152,12 +283,18 @@ einen Abend gekostet.
 - [ ] README mit „Fehlersuche"-Tabelle beginnen, sobald der erste Abend verloren
       ging – nicht am Ende
 
-## 6. Diese Datei im Chat nutzen
+## 7. Diese Datei im Chat nutzen
 
 Im neuen Projekt-Chat genügt ein Verweis, z. B.:
 
 > Lies `C:\Users\joe\Documents\ESP-IDF\Projects\E32R28T_erste_Tests\PORTING.md`
 > und lege danach das Projekt für den SHT31-Außensensor an.
+
+Oder für das neue Display:
+
+> Lies `C:\Users\joe\Documents\ESP-IDF\Projects\E32R28T_erste_Tests\PORTING.md`,
+> Abschnitt 4 (ES3C28). Das neue Projekt liegt in `…\ES3C28_Thermometer`,
+> `data\backgrounds` ist schon kopiert.
 
 Besser ist, `PORTING.md` und `.github/copilot-instructions.md` gleich in das neue
 Repository zu kopieren – dann liegen sie im Arbeitsverzeichnis und werden ohne
