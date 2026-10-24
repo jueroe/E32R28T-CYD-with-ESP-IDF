@@ -22,6 +22,10 @@
 #define NETCFG_NAME_MAX      32
 #define NETCFG_REMOTE_MAX    63
 
+/* Calibration offset added to every temperature reading, in tenths of a degree
+ * (NVS stores an integer).  ±5.0 °C is plenty for a sensor placement error. */
+#define NETCFG_OFFSET_LIMIT_TENTHS 50
+
 typedef struct {
     char ssid[NETCFG_SSID_MAX + 1];
     char password[NETCFG_PASSWORD_MAX + 1];
@@ -29,6 +33,7 @@ typedef struct {
     char longitude[NETCFG_COORD_MAX];
     char name[NETCFG_NAME_MAX + 1];     /* shown in the browser, router and log */
     char remote[NETCFG_REMOTE_MAX + 1]; /* outdoor sensor, empty = none */
+    int16_t offset_tenths;              /* temperature calibration, 0.1 °C steps */
 } netcfg_t;
 
 /**
@@ -72,6 +77,12 @@ void netcfg_hostname(char *out, size_t size);
 
 /** IP or host name of the outdoor sensor, "" when none was configured. */
 const char *netcfg_remote(void);
+
+/**
+ * Calibration offset for the temperature, in tenths of a degree (-15 = -1.5 °C).
+ * sensor.c adds it to every reading, so display and JSON agree.
+ */
+int netcfg_temp_offset_tenths(void);
 
 /** Build the sunrise-sunset.org request URL from the effective coordinates. */
 void netcfg_sun_url(char *out, size_t size);

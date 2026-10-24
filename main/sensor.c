@@ -13,6 +13,7 @@
 #include "i2c_bus.h"
 
 #include "board_e32r28t.h"
+#include "netcfg.h"
 
 static const char *TAG = "sensor";
 
@@ -128,12 +129,21 @@ esp_err_t sensor_read(sensor_reading_t *reading)
         err = bme280_read_pressure(s_bme280, &reading->pressure_hpa);
     }
 
-    if (err == ESP_OK && s_last_lock != NULL) {
-        xSemaphoreTake(s_last_lock, portMAX_DELAY);
-        s_last = *reading;
-        s_last_us = esp_timer_get_time();
-        s_last_valid = true;
-        xSemaphoreGive(s_last_lock);
+    if (err == ESP_OK) {
+        /* calibration: the configured offset applies to every reading, so the
+         * display and the JSON endpoint show the same corrected value */
+        const int offset = netcfg_temp_offset_tenths();
+        if (offset != 0) {
+            reading->temperature_c += (float)offset / 10.0f;
+        }
+
+        if (s_last_lock != NULL) {
+            xSemaphoreTake(s_last_lock, portMAX_DELAY);
+            s_last = *reading;
+            s_last_us = esp_timer_get_time();
+            s_last_valid = true;
+            xSemaphoreGive(s_last_lock);
+        }
     }
     return err;
 }

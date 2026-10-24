@@ -6,13 +6,19 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 
 #include "board_e32r28t.h"
 #include "connect.h"
@@ -22,6 +28,7 @@
 #include "textutil.h"
 #include "touch.h"
 #include "ttf.h"
+#include "watchdog.h"
 #include "webserver.h"
 #include "wifi.h"
 
@@ -42,6 +49,16 @@ static const char *TAG = "configmode";
 /* Delay between the answer to /save and the restart, so the browser still gets it */
 #define CONFIGMODE_RESTART_DELAY_US (1500 * 1000)
 
+/* The scan runs in the background: it takes a few seconds while the access
+ * point is up, and the page must answer immediately (phone browsers give up
+ * quickly and fall back to mobile data when the Wi-Fi has no internet). */
+#define CONFIGMODE_SCAN_INTERVAL_MS 20000
+
+/* Safety net for a unit that is already mounted: when nobody configured it for
+ * this long, it restarts and tries the stored network again - otherwise a boot
+ * without coverage would leave it in the access point for good. */
+#define CONFIGMODE_IDLE_RESTART_MS (15 * 60 * 1000)
+
 #define CFG_COLOR_BG           GFX_RGB565(0x10, 0x14, 0x18)
 #define CFG_COLOR_CARD         GFX_RGB565(0x1B, 0x23, 0x2B)
 #define CFG_COLOR_LINE         GFX_RGB565(0x2C, 0x38, 0x44)
@@ -58,10 +75,11 @@ typedef enum {
 static volatile bool s_requested;
 static volatile configmode_reason_t s_reason = CONFIGMODE_REASON_NETWORK;
 
-/* Scan result, filled before the web server starts and on /rescan (which runs
- * in the web server task - the display task does not touch it) */
+/* Scan result, filled by the background scan task; the web handlers read it
+ * under s_scan_lock */
 static wifi_ap_info_t s_aps[CONFIGMODE_MAX_APS];
 static int s_ap_count;
+static SemaphoreHandle_t s_scan_lock;
 
 /* WLAN data of the access point of this device */
 static char s_ap_ip[16];
@@ -69,6 +87,17 @@ static char s_ap_ip[16];
 /* Restart request from the web page */
 static volatile int64_t s_restart_at_us;
 static volatile bool s_saved;
+
+/* Last client activity, used by the idle restart */
+static volatile int64_t s_last_activity_us;
+
+/* Set by /rescan: the scan task starts over instead of waiting for its interval */
+static volatile bool s_rescan;
+
+static void note_activity(void)
+{
+    s_last_activity_us = esp_timer_get_time();
+}
 
 void configmode_request(void)
 {
@@ -118,6 +147,218 @@ bool configmode_corner_touched(void)
     ESP_LOGI(TAG, "corner pressed for %d ms, opening the WLAN configuration",
              LAYOUT_CONFIG_HOLD_MS);
     return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Background scan                                                           */
+/* ------------------------------------------------------------------------- */
+
+/* A scan while the access point is up switches the channel and costs a few
+ * seconds, so it runs on its own task and the page always answers at once. */
+static void scan_task(void *argument)
+{
+    (void)argument;
+
+    watchdog_subscribe();
+
+    for (;;) {
+        wifi_ap_info_t found[CONFIGMODE_MAX_APS];
+        const int count = wifi_scan_networks(found, CONFIGMODE_MAX_APS);
+
+        if (s_scan_lock != NULL) {
+            xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+            memcpy(s_aps, found, sizeof(found));
+            s_ap_count = count;
+            xSemaphoreGive(s_scan_lock);
+        }
+
+        for (int i = 0; i < count; i++) {
+            ESP_LOGI(TAG, "  %2d: \"%s\", %d dBm, %s", i + 1, found[i].ssid, found[i].rssi,
+                     found[i].secured ? "secured" : "open");
+        }
+
+        /* sleep in slices, so that /rescan takes effect quickly and the
+         * watchdog sees a live task */
+        for (int waited = 0; waited < CONFIGMODE_SCAN_INTERVAL_MS && !s_rescan; waited += 500) {
+            watchdog_feed();
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        s_rescan = false;
+        watchdog_feed();
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* DNS and captive portal                                                    */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Minimal DNS server: every name resolves to the access point.
+ *
+ * Phones look up the address of their connectivity check host (for Android
+ * "connectivitycheck.gstatic.com") before they send the HTTP request.  Without
+ * DNS that lookup fails, no request arrives, and the phone silently marks the
+ * network as "no internet".  Answering all names with the access point address
+ * makes the check land on our server, whose redirect then opens the form.
+ */
+
+/* Decode the question name (labels joined by dots) for the log. */
+static void dns_log_question(const uint8_t *query, int length)
+{
+    char name[128];
+    size_t used = 0;
+    size_t pos = 12;
+
+    while (pos < (size_t)length) {
+        const uint8_t label = query[pos];
+        if (label == 0 || (label & 0xC0) == 0xC0) {
+            break;
+        }
+        if (used + label + 2 >= sizeof(name)) {
+            break;
+        }
+        if (used > 0) {
+            name[used++] = '.';
+        }
+        memcpy(&name[used], &query[pos + 1], label);
+        used += label;
+        pos += (size_t)label + 1;
+    }
+    name[used] = '\0';
+
+    const uint16_t type =
+        (pos + 2 < (size_t)length) ? (uint16_t)((query[pos + 1] << 8) | query[pos + 2]) : 0;
+    ESP_LOGI(TAG, "DNS query: %s (type %u)", name[0] != '\0' ? name : "?", type);
+}
+
+static size_t dns_build_answer(const uint8_t *query, int length, uint8_t *answer, size_t size)
+{
+    if (length < 12 + 5 || size < 12 + 16) {
+        return 0;
+    }
+
+    /* walk over the question name: labels, terminated by a zero byte or a
+     * compression pointer */
+    size_t pos = 12;
+    while (pos < (size_t)length) {
+        const uint8_t label = query[pos];
+        if (label == 0) {
+            pos++;
+            break;
+        }
+        if ((label & 0xC0) == 0xC0) {
+            pos += 2;
+            break;
+        }
+        pos += (size_t)label + 1;
+    }
+    if (pos + 4 > (size_t)length) {
+        return 0;
+    }
+
+    const uint16_t type = (uint16_t)((query[pos] << 8) | query[pos + 1]);
+    const size_t question_end = pos + 4;
+    if (question_end + 16 > size) {
+        return 0;
+    }
+
+    memcpy(answer, query, question_end);
+    answer[2] = (uint8_t)(0x80 | (query[2] & 0x01)); /* response, RD copied */
+    answer[3] = 0x80;                                /* recursion available, no error */
+    const bool with_address = type == 1;              /* A, not AAAA */
+    answer[6] = 0;
+    answer[7] = with_address ? 1 : 0;
+    answer[8] = 0;
+    answer[9] = 0;
+    answer[10] = 0;
+    answer[11] = 0;
+
+    if (!with_address) {
+        return question_end;
+    }
+
+    size_t out = question_end;
+    answer[out++] = 0xC0; /* name: pointer to the question */
+    answer[out++] = 0x0C;
+    answer[out++] = 0x00; /* type A */
+    answer[out++] = 0x01;
+    answer[out++] = 0x00; /* class IN */
+    answer[out++] = 0x01;
+    answer[out++] = 0x00; /* TTL 60 s */
+    answer[out++] = 0x00;
+    answer[out++] = 0x00;
+    answer[out++] = 60;
+    answer[out++] = 0x00; /* 4 bytes of address */
+    answer[out++] = 0x04;
+    answer[out++] = 192;
+    answer[out++] = 168;
+    answer[out++] = 4;
+    answer[out++] = 1;
+    return out;
+}
+
+static void dns_task(void *argument)
+{
+    (void)argument;
+
+    const int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "no socket for the DNS answerer");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct sockaddr_in bind_address = {0};
+    bind_address.sin_family = AF_INET;
+    bind_address.sin_port = htons(53);
+    bind_address.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sock, (struct sockaddr *)&bind_address, sizeof(bind_address)) < 0) {
+        ESP_LOGE(TAG, "cannot bind the DNS port");
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "DNS: every name answers with %s",
+             s_ap_ip[0] != '\0' ? s_ap_ip : "192.168.4.1");
+
+    uint8_t query[512];
+    uint8_t answer[512];
+    for (;;) {
+        struct sockaddr_in from;
+        socklen_t from_length = sizeof(from);
+        const int length =
+            recvfrom(sock, query, sizeof(query), 0, (struct sockaddr *)&from, &from_length);
+        if (length < 12) {
+            continue;
+        }
+        const size_t answer_length = dns_build_answer(query, length, answer, sizeof(answer));
+        if (answer_length == 0) {
+            continue;
+        }
+        dns_log_question(query, length);
+        sendto(sock, answer, answer_length, 0, (struct sockaddr *)&from, from_length);
+    }
+}
+
+/* A client connected or left: that counts as activity for the idle restart. */
+static void ap_event_handler(void *argument, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)argument;
+    (void)base;
+
+    if (id == WIFI_EVENT_AP_STACONNECTED) {
+        const wifi_event_ap_staconnected_t *event = (const wifi_event_ap_staconnected_t *)data;
+        ESP_LOGI(TAG, "client %02x:%02x:%02x:%02x:%02x:%02x connected", event->mac[0],
+                 event->mac[1], event->mac[2], event->mac[3], event->mac[4], event->mac[5]);
+    } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+        const wifi_event_ap_stadisconnected_t *event =
+            (const wifi_event_ap_stadisconnected_t *)data;
+        ESP_LOGI(TAG, "client %02x:%02x:%02x:%02x:%02x:%02x disconnected", event->mac[0],
+                 event->mac[1], event->mac[2], event->mac[3], event->mac[4], event->mac[5]);
+    } else {
+        return;
+    }
+    s_last_activity_us = esp_timer_get_time();
 }
 
 /* ------------------------------------------------------------------------- */
@@ -323,7 +564,7 @@ static const char *PAGE_TAIL =
     "<label for=\"ssid_manual\">Anderes Netzwerk (optional, für versteckte Namen)</label>"
     "<input id=\"ssid_manual\" name=\"ssid_manual\" maxlength=\"32\" autocapitalize=\"off\" "
     "autocorrect=\"off\" autocomplete=\"off\">"
-    "<label for=\"password\">Passwort (leer lassen für ein offenes Netzwerk)</label>"
+    "<label for=\"password\">Passwort (leer = gespeichertes behalten)</label>"
     "<input id=\"password\" name=\"password\" type=\"password\" maxlength=\"63\" "
     "autocomplete=\"off\">"
     "<label for=\"lat\">Standort für die Sonnenzeiten: Breite / Länge</label>"
@@ -334,6 +575,11 @@ static const char *PAGE_TAIL =
     "<label for=\"remote\">Außentemperatursensor: IP-Adresse (optional)</label>"
     "<input id=\"remote\" name=\"remote\" maxlength=\"63\" placeholder=\"z. B. 192.168.123.50\" "
     "autocapitalize=\"off\" autocorrect=\"off\" autocomplete=\"off\" value=\"%s\">"
+    "<label for=\"offset\">Temperatur-Offset in °C (Kalibrierung)</label>"
+    "<input id=\"offset\" name=\"offset\" inputmode=\"decimal\" maxlength=\"6\" "
+    "placeholder=\"z. B. -0,5\" value=\"%s\">"
+    "<p style=\"font-size:13px;margin:6px 0 0\">Wird zu jedem Messwert addiert, in 0,1-Schritten, "
+    "erlaubt sind −5,0 bis +5,0. Leer oder 0 lässt die Anzeige unverändert.</p>"
     "<div class=\"row\">"
     "<button class=\"cancel\" type=\"submit\" formaction=\"/cancel\" formnovalidate>Abbrechen"
     "</button><button class=\"save\" type=\"submit\">Speichern</button>"
@@ -343,6 +589,8 @@ static const char *PAGE_TAIL =
 
 static esp_err_t handler_root(httpd_req_t *req)
 {
+    note_activity();
+
     char *buffer = malloc(CONFIGMODE_PAGE_SIZE);
     if (buffer == NULL) {
         ESP_LOGE(TAG, "no memory for the %d byte page", CONFIGMODE_PAGE_SIZE);
@@ -368,15 +616,24 @@ static esp_err_t handler_root(httpd_req_t *req)
              "<label for=\"ssid\">Netzwerk</label><select id=\"ssid\" name=\"ssid\">",
              escaped_name, escaped_name);
 
-    if (s_ap_count == 0) {
+    /* the list is written by the background scan task */
+    int ap_count = 0;
+    if (s_scan_lock != NULL) {
+        xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+        ap_count = s_ap_count;
+    }
+    if (ap_count == 0) {
         page_add(&page, "<option value=\"\">kein Netzwerk gefunden</option>");
     }
-    for (int i = 0; i < s_ap_count; i++) {
+    for (int i = 0; i < ap_count; i++) {
         char escaped[200];
         html_escape(s_aps[i].ssid, escaped, sizeof(escaped));
         page_add(&page, "<option value=\"%s\"%s>%s (%d dBm%s)</option>", escaped,
                  strcmp(s_aps[i].ssid, cfg.ssid) == 0 ? " selected" : "", escaped, s_aps[i].rssi,
                  s_aps[i].secured ? ", gesichert" : ", offen");
+    }
+    if (s_scan_lock != NULL) {
+        xSemaphoreGive(s_scan_lock);
     }
 
     char latitude[NETCFG_COORD_MAX * 6];
@@ -386,7 +643,13 @@ static esp_err_t handler_root(httpd_req_t *req)
     html_escape(cfg.longitude, longitude, sizeof(longitude));
     html_escape(cfg.remote, remote, sizeof(remote));
 
-    page_add(&page, PAGE_TAIL, latitude, longitude, remote);
+    /* the offset with a decimal comma, as a German user types it */
+    char offset[16];
+    const int offset_tenths = cfg.offset_tenths;
+    snprintf(offset, sizeof(offset), "%s%d,%d", offset_tenths < 0 ? "-" : "",
+             abs(offset_tenths) / 10, abs(offset_tenths) % 10);
+
+    page_add(&page, PAGE_TAIL, latitude, longitude, remote, offset);
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     const esp_err_t err = page.ok ? httpd_resp_send(req, buffer, HTTPD_RESP_USE_STRLEN)
@@ -420,6 +683,8 @@ static esp_err_t send_message(httpd_req_t *req, int status, const char *title,
 
 static esp_err_t handler_save(httpd_req_t *req)
 {
+    note_activity();
+
     char body[512];
     if (receive_body(req, body, sizeof(body) - 1) <= 0) {
         return send_message(req, 400, "Nichts empfangen",
@@ -473,7 +738,15 @@ static esp_err_t handler_save(httpd_req_t *req)
             return send_message(req, 400, "Passwort zu lang",
                                 "Ein WLAN-Passwort hat höchstens 63 Zeichen.");
         }
-        strlcpy(next.password, raw, sizeof(next.password));
+        /* The field always starts empty.  On an unchanged network that means
+         * "keep the stored password", otherwise changing only the offset or the
+         * name would cut the connection. */
+        const bool ssid_changed = strcmp(next.ssid, cfg.ssid) != 0;
+        if (length == 0 && !ssid_changed && cfg.password[0] != '\0') {
+            ESP_LOGI(TAG, "web: password empty on an unchanged network, keeping the stored one");
+        } else {
+            strlcpy(next.password, raw, sizeof(next.password));
+        }
     }
 
     /* coordinates: an empty field keeps the value in use */
@@ -508,13 +781,42 @@ static esp_err_t handler_save(httpd_req_t *req)
         strlcpy(next.remote, raw, sizeof(next.remote));
     }
 
+    /* temperature calibration: a decimal comma or point, an empty field is 0 */
+    if (form_value(body, "offset", raw, sizeof(raw))) {
+        if (raw[0] == '\0') {
+            next.offset_tenths = 0;
+        } else {
+            /* strtod() only knows the decimal point, a German keyboard gives a
+             * comma - accept both */
+            char number[CONFIGMODE_VALUE_MAX + 1];
+            strlcpy(number, raw, sizeof(number));
+            for (char *c = number; *c != '\0'; c++) {
+                if (*c == ',') {
+                    *c = '.';
+                }
+            }
+
+            char *end = NULL;
+            const double value = strtod(number, &end);
+            const double rounded = (double)(int)(value * 10.0 + (value < 0 ? -0.5 : 0.5));
+            if (end == number || *end != '\0' || rounded < -NETCFG_OFFSET_LIMIT_TENTHS ||
+                rounded > NETCFG_OFFSET_LIMIT_TENTHS) {
+                return send_message(req, 400, "Temperatur-Offset ungültig",
+                                    "Bitte einen Wert zwischen -5,0 und +5,0 eintragen, zum "
+                                    "Beispiel -0,5. Leer oder 0 bedeutet keine Korrektur.");
+            }
+            next.offset_tenths = (int16_t)rounded;
+        }
+    }
+
     const esp_err_t err = netcfg_save(&next);
     if (err != ESP_OK) {
         return send_message(req, 400, "Speichern fehlgeschlagen",
                             "Die Einstellungen konnten nicht abgelegt werden.");
     }
 
-    ESP_LOGI(TAG, "web: stored \"%s\", restarting", next.ssid);
+    ESP_LOGI(TAG, "web: stored \"%s\", offset %d.%d C, restarting", next.ssid,
+             next.offset_tenths / 10, abs(next.offset_tenths % 10));
     s_saved = true;
     s_restart_at_us = esp_timer_get_time() + CONFIGMODE_RESTART_DELAY_US;
 
@@ -525,6 +827,7 @@ static esp_err_t handler_save(httpd_req_t *req)
 
 static esp_err_t handler_cancel(httpd_req_t *req)
 {
+    note_activity();
     ESP_LOGI(TAG, "web: cancelled");
     return send_message(req, 200, "Abgebrochen",
                         "Es wurde nichts geändert. Diese Seite kann geschlossen werden. "
@@ -533,21 +836,77 @@ static esp_err_t handler_cancel(httpd_req_t *req)
 
 static esp_err_t handler_rescan(httpd_req_t *req)
 {
-    s_ap_count = wifi_scan_networks(s_aps, CONFIGMODE_MAX_APS);
-    ESP_LOGI(TAG, "web: rescanned, %d networks", s_ap_count);
+    note_activity();
+    s_rescan = true;
+    ESP_LOGI(TAG, "web: rescan requested");
 
     httpd_resp_set_status(req, "303 See Other");
     httpd_resp_set_hdr(req, "Location", "/");
     return httpd_resp_send(req, NULL, 0);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Connectivity checks                                                       */
+/* ------------------------------------------------------------------------- */
+
+/* Answer the checks of the operating systems as "everything is fine".
+ * Otherwise the phone marks the network as "no internet", shows the "!" and
+ * moves its traffic to mobile data, which makes the configuration page
+ * unreachable. */
+static esp_err_t handler_no_content(httpd_req_t *req)
+{
+    note_activity();
+    ESP_LOGI(TAG, "connectivity check %s -> 204", req->uri);
+    httpd_resp_set_status(req, "204 No Content");
+    return httpd_resp_send(req, NULL, 0);
+}
+
+static esp_err_t handler_apple_success(httpd_req_t *req)
+{
+    note_activity();
+    ESP_LOGI(TAG, "connectivity check %s -> Success", req->uri);
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req,
+                           "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>",
+                           HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t handler_ncsi(httpd_req_t *req)
+{
+    note_activity();
+    const bool ncsi = strcmp(req->uri, "/ncsi.txt") == 0;
+    ESP_LOGI(TAG, "connectivity check %s -> text", req->uri);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, ncsi ? "Microsoft NCSI" : "Microsoft Connect Test",
+                           HTTPD_RESP_USE_STRLEN);
+}
+
+/* Every other path leads to the form, so any address the user types ends up in
+ * the configuration. */
+static esp_err_t handler_captive(httpd_req_t *req)
+{
+    note_activity();
+    ESP_LOGD(TAG, "%s %s -> redirect", req->method == HTTP_POST ? "POST" : "GET", req->uri);
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    return httpd_resp_send(req, "Konfiguration: http://192.168.4.1/", HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t web_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.stack_size = 6144;
-    config.max_open_sockets = 3;
+    config.stack_size = 8192;
+    /* a phone opens several connections at once while probing for a portal */
+    config.max_open_sockets = 4;
     config.lru_purge_enable = true;
+    /* form, save, cancel, rescan, six connectivity checks and the wildcard */
+    config.max_uri_handlers = 14;
+    /* required for the wildcard handlers below: without it the server only
+     * compares strings and answers 404 to every unknown path */
+    config.uri_match_fn = httpd_uri_match_wildcard;
 
     httpd_handle_t server = NULL;
     esp_err_t err = httpd_start(&server, &config);
@@ -561,6 +920,19 @@ static esp_err_t web_start(void)
         {.uri = "/save", .method = HTTP_POST, .handler = handler_save, .user_ctx = NULL},
         {.uri = "/cancel", .method = HTTP_POST, .handler = handler_cancel, .user_ctx = NULL},
         {.uri = "/rescan", .method = HTTP_GET, .handler = handler_rescan, .user_ctx = NULL},
+        /* connectivity checks: answer as if the internet worked */
+        {.uri = "/generate_204", .method = HTTP_GET, .handler = handler_no_content,
+         .user_ctx = NULL},
+        {.uri = "/gen_204", .method = HTTP_GET, .handler = handler_no_content, .user_ctx = NULL},
+        {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = handler_apple_success,
+         .user_ctx = NULL},
+        {.uri = "/library/test/success.html", .method = HTTP_GET, .handler = handler_apple_success,
+         .user_ctx = NULL},
+        {.uri = "/connecttest.txt", .method = HTTP_GET, .handler = handler_ncsi, .user_ctx = NULL},
+        {.uri = "/ncsi.txt", .method = HTTP_GET, .handler = handler_ncsi, .user_ctx = NULL},
+        /* everything else: redirect to the form */
+        {.uri = "/*", .method = HTTP_GET, .handler = handler_captive, .user_ctx = NULL},
+        {.uri = "/*", .method = HTTP_POST, .handler = handler_captive, .user_ctx = NULL},
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         err = httpd_register_uri_handler(server, &uris[i]);
@@ -602,13 +974,39 @@ void configmode_run(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel)
         esp_restart();
     }
 
-    s_ap_count = wifi_scan_networks(s_aps, CONFIGMODE_MAX_APS);
-    for (int i = 0; i < s_ap_count; i++) {
-        ESP_LOGI(TAG, "  %2d: \"%s\", %d dBm, %s", i + 1, s_aps[i].ssid, s_aps[i].rssi,
-                 s_aps[i].secured ? "secured" : "open");
+    /* Hand the access point itself out as DNS server, so phones resolve their
+     * connectivity check host to us (see dns_task). */
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif != NULL) {
+        esp_netif_dns_info_t dns = {0};
+        dns.ip.type = ESP_IPADDR_TYPE_V4;
+        dns.ip.u_addr.ip4.addr = esp_ip4addr_aton(s_ap_ip);
+        const esp_err_t dns_err = esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+        if (dns_err != ESP_OK) {
+            ESP_LOGW(TAG, "cannot offer %s as DNS: %s", s_ap_ip, esp_err_to_name(dns_err));
+        }
+    }
+    xTaskCreate(dns_task, "dns", 4096, NULL, 3, NULL);
+
+    /* the scan list is filled in the background; the first page shows what is
+     * already there */
+    if (s_scan_lock == NULL) {
+        s_scan_lock = xSemaphoreCreateMutex();
+    }
+    if (s_scan_lock != NULL) {
+        xTaskCreate(scan_task, "scan", 4096, NULL, 3, NULL);
+    } else {
+        ESP_LOGE(TAG, "no memory for the scan lock - the network list stays empty");
     }
 
+    esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, ap_event_handler,
+                                        NULL, NULL);
+    esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED,
+                                        ap_event_handler, NULL, NULL);
+
     web_start();
+
+    note_activity();
 
     const char *status = s_reason == CONFIGMODE_REASON_NETWORK
                              ? "kein Netzwerk - bitte einrichten"
@@ -623,9 +1021,25 @@ void configmode_run(gfx_canvas_t *canvas, esp_lcd_panel_handle_t panel)
     bool back_pressed_last = false;
     bool saved_shown = false;
 
+    watchdog_subscribe();
+
     for (;;) {
+        watchdog_feed();
+
         if (s_restart_at_us != 0 && esp_timer_get_time() >= s_restart_at_us) {
             ESP_LOGI(TAG, "restarting with the new settings");
+            esp_restart();
+        }
+
+        /* nobody configured the unit for a long time: go back and try the
+         * stored network, an already mounted device must not stay an access
+         * point forever */
+        if (esp_timer_get_time() - s_last_activity_us >=
+            (int64_t)CONFIGMODE_IDLE_RESTART_MS * 1000) {
+            ESP_LOGW(TAG, "%d minutes without a configuration - restarting to try the stored "
+                          "network",
+                     CONFIGMODE_IDLE_RESTART_MS / 60000);
+            vTaskDelay(pdMS_TO_TICKS(200));
             esp_restart();
         }
 

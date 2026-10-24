@@ -6,6 +6,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -32,6 +33,7 @@ static bool s_initialized;
 static bool s_auto_connect; /* only reconnect once wifi_connect() asked for it */
 static bool s_connected;
 static bool s_was_connected;
+static bool s_pinned; /* sta.bssid_set is in use */
 static int s_retries;
 static char s_ip[16];
 
@@ -61,6 +63,20 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
             ESP_LOGW(TAG, "disconnected (reason %d), retry %d", event->reason, s_retries);
             esp_wifi_connect();
         } else {
+            if (s_pinned) {
+                /* the chosen access point of the mesh is gone - let the driver
+                 * pick again instead of giving up */
+                ESP_LOGW(TAG, "the pinned access point does not answer, choosing freely again");
+                s_pinned = false;
+                wifi_config_t current;
+                if (esp_wifi_get_config(WIFI_IF_STA, &current) == ESP_OK) {
+                    current.sta.bssid_set = false;
+                    esp_wifi_set_config(WIFI_IF_STA, &current);
+                }
+                s_retries = 0;
+                esp_wifi_connect();
+                return;
+            }
             ESP_LOGE(TAG, "cannot reach the network (reason %d, e.g. 201 = network not found, "
                           "15 = wrong password), continuing without network",
                      event->reason);
@@ -143,7 +159,8 @@ esp_err_t wifi_init(void)
     return ESP_OK;
 }
 
-bool wifi_connect(const char *ssid, const char *password, uint32_t timeout_ms)
+bool wifi_connect_bssid(const char *ssid, const char *password, const uint8_t *bssid,
+                       uint32_t timeout_ms)
 {
     if (ssid == NULL || ssid[0] == '\0') {
         ESP_LOGE(TAG, "no network name configured");
@@ -159,6 +176,17 @@ bool wifi_connect(const char *ssid, const char *password, uint32_t timeout_ms)
              password != NULL ? password : "");
     wifi_configuration.sta.threshold.authmode =
         wifi_configuration.sta.password[0] != '\0' ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+
+    /* A mesh runs several access points with the same name and the driver does
+     * not always pick the strongest one.  When a BSSID is given, that one is
+     * used; the disconnect handler drops the pin when it stops answering. */
+    if (bssid != NULL) {
+        memcpy(wifi_configuration.sta.bssid, bssid, sizeof(wifi_configuration.sta.bssid));
+        wifi_configuration.sta.bssid_set = true;
+        s_pinned = true;
+    } else {
+        s_pinned = false;
+    }
 
     /* the interface is already running: stop the old attempt, take the new
      * credentials and reconnect deliberately */
@@ -194,7 +222,13 @@ bool wifi_connect(const char *ssid, const char *password, uint32_t timeout_ms)
         ESP_LOGW(TAG, "no IP address within %u ms", (unsigned)timeout_ms);
     }
     s_auto_connect = false;
+    s_pinned = false;
     return false;
+}
+
+bool wifi_connect(const char *ssid, const char *password, uint32_t timeout_ms)
+{
+    return wifi_connect_bssid(ssid, password, NULL, timeout_ms);
 }
 
 void wifi_stop_sta(void)
@@ -220,6 +254,12 @@ esp_err_t wifi_start_ap(const char *ssid, const char *password, char *ip, size_t
 
     wifi_stop_sta();
 
+    /* Deterministic restart: without esp_wifi_stop() a driver that already runs
+     * in station mode may keep the access point down. */
+    if (esp_wifi_stop() != ESP_OK) {
+        ESP_LOGD(TAG, "the driver was not running");
+    }
+
     /* The station interface stays enabled (mode APSTA) so that the scan works
      * while the access point is running; it has no credentials and therefore
      * never connects. */
@@ -229,7 +269,11 @@ esp_err_t wifi_start_ap(const char *ssid, const char *password, char *ip, size_t
         return err;
     }
 
-    esp_netif_t *ap = esp_netif_create_default_wifi_ap();
+    static esp_netif_t *s_ap_netif;
+    if (s_ap_netif == NULL) {
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+    }
+    esp_netif_t *ap = s_ap_netif;
     if (ap == NULL) {
         ESP_LOGE(TAG, "cannot create the access point interface");
         return ESP_FAIL;
@@ -250,7 +294,6 @@ esp_err_t wifi_start_ap(const char *ssid, const char *password, char *ip, size_t
 
     err = esp_wifi_set_config(WIFI_IF_AP, &ap_configuration);
     if (err == ESP_OK) {
-        /* stops the station interface and starts the access point */
         err = esp_wifi_start();
         if (err == ESP_ERR_WIFI_STATE) {
             err = ESP_OK; /* already running, the new AP configuration applies anyway */
@@ -261,8 +304,17 @@ esp_err_t wifi_start_ap(const char *ssid, const char *password, char *ip, size_t
         return err;
     }
 
+    /* the address is assigned right after the start, give it a moment */
     esp_netif_ip_info_t ip_info;
-    if (esp_netif_get_ip_info(ap, &ip_info) == ESP_OK) {
+    esp_err_t ip_err = ESP_FAIL;
+    for (int attempt = 0; attempt < 25; attempt++) {
+        ip_err = esp_netif_get_ip_info(ap, &ip_info);
+        if (ip_err == ESP_OK && ip_info.ip.addr != 0) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (ip_err == ESP_OK && ip_info.ip.addr != 0) {
         snprintf(ip, ip_size, IPSTR, IP2STR(&ip_info.ip));
     } else {
         snprintf(ip, ip_size, "%s", "192.168.4.1");
@@ -271,6 +323,55 @@ esp_err_t wifi_start_ap(const char *ssid, const char *password, char *ip, size_t
     ESP_LOGI(TAG, "access point \"%s\" (%s) at http://%s", ssid,
              ap_configuration.ap.authmode == WIFI_AUTH_OPEN ? "open" : "WPA2", ip);
     return ESP_OK;
+}
+
+int wifi_scan_all(wifi_bss_t *out, int max)
+{
+    if (out == NULL || max <= 0 || !s_initialized) {
+        return 0;
+    }
+
+    const wifi_scan_config_t scan_configuration = {
+        .show_hidden = true,
+    };
+    esp_err_t err = esp_wifi_scan_start(&scan_configuration, true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "scan failed: %s", esp_err_to_name(err));
+        return 0;
+    }
+
+    uint16_t found = 0;
+    if (esp_wifi_scan_get_ap_num(&found) != ESP_OK || found == 0) {
+        esp_wifi_clear_ap_list();
+        return 0;
+    }
+
+    wifi_ap_record_t *records = calloc(found, sizeof(wifi_ap_record_t));
+    if (records == NULL) {
+        esp_wifi_clear_ap_list();
+        return 0;
+    }
+
+    uint16_t count = found;
+    if (esp_wifi_scan_get_ap_records(&count, records) != ESP_OK) {
+        count = 0;
+    }
+    esp_wifi_clear_ap_list();
+
+    int used = 0;
+    for (uint16_t i = 0; i < count && used < max; i++) {
+        if (records[i].ssid[0] == '\0') {
+            continue;
+        }
+        snprintf(out[used].ssid, sizeof(out[used].ssid), "%s", (const char *)records[i].ssid);
+        memcpy(out[used].bssid, records[i].bssid, sizeof(out[used].bssid));
+        out[used].rssi = records[i].rssi;
+        out[used].channel = records[i].primary;
+        used++;
+    }
+
+    free(records);
+    return used;
 }
 
 int wifi_scan_networks(wifi_ap_info_t *out, int max)
@@ -405,4 +506,24 @@ void wifi_log_link(void)
     }
     ESP_LOGI(TAG, "link to \"%s\": channel %d, RSSI %d dBm, IP %s", (const char *)ap.ssid,
              ap.primary, ap.rssi, s_ip);
+}
+
+bool wifi_link_info(char *ssid, size_t ssid_size, char *bssid, size_t bssid_size, int *channel)
+{
+    wifi_ap_record_t ap;
+    if (!s_connected || esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        return false;
+    }
+
+    if (ssid != NULL && ssid_size > 0) {
+        snprintf(ssid, ssid_size, "%s", (const char *)ap.ssid);
+    }
+    if (bssid != NULL && bssid_size >= 18) {
+        snprintf(bssid, bssid_size, "%02x:%02x:%02x:%02x:%02x:%02x", ap.bssid[0], ap.bssid[1],
+                 ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+    }
+    if (channel != NULL) {
+        *channel = ap.primary;
+    }
+    return true;
 }

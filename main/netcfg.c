@@ -1,6 +1,7 @@
 #include "netcfg.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -18,6 +19,7 @@ static const char *TAG = "netcfg";
 #define NETCFG_KEY_LON    "lon"
 #define NETCFG_KEY_NAME   "name"
 #define NETCFG_KEY_REMOTE "remote"
+#define NETCFG_KEY_OFFSET "off"
 #define NETCFG_KEY_SKIP   "skip"
 
 /* Long enough for the longest value (password: 63 characters plus NUL) */
@@ -96,6 +98,16 @@ static void load_once(void)
      * network data */
     read_string(handle, NETCFG_KEY_NAME, s_cfg.name, sizeof(s_cfg.name));
     read_string(handle, NETCFG_KEY_REMOTE, s_cfg.remote, sizeof(s_cfg.remote));
+
+    int16_t offset = 0;
+    if (nvs_get_i16(handle, NETCFG_KEY_OFFSET, &offset) == ESP_OK) {
+        if (offset < -NETCFG_OFFSET_LIMIT_TENTHS) {
+            offset = -NETCFG_OFFSET_LIMIT_TENTHS;
+        } else if (offset > NETCFG_OFFSET_LIMIT_TENTHS) {
+            offset = NETCFG_OFFSET_LIMIT_TENTHS;
+        }
+        s_cfg.offset_tenths = offset;
+    }
     nvs_close(handle);
 }
 
@@ -140,6 +152,9 @@ esp_err_t netcfg_save(const netcfg_t *cfg)
     if (err == ESP_OK) {
         err = nvs_set_str(handle, NETCFG_KEY_REMOTE, cfg->remote);
     }
+    if (err == ESP_OK) {
+        err = nvs_set_i16(handle, NETCFG_KEY_OFFSET, cfg->offset_tenths);
+    }
     /* a fresh configuration clears "start without WLAN" */
     if (err == ESP_OK) {
         err = nvs_set_u8(handle, NETCFG_KEY_SKIP, 0);
@@ -157,8 +172,9 @@ esp_err_t netcfg_save(const netcfg_t *cfg)
     s_cfg = *cfg;
     s_from_nvs = true;
     s_loaded = true;
-    ESP_LOGI(TAG, "stored \"%s\": WLAN \"%s\", location %s / %s, outdoor sensor %s", s_cfg.name,
-             s_cfg.ssid, s_cfg.latitude, s_cfg.longitude,
+    ESP_LOGI(TAG, "stored \"%s\": WLAN \"%s\", location %s / %s, offset %d.%d C, outdoor sensor %s",
+             s_cfg.name, s_cfg.ssid, s_cfg.latitude, s_cfg.longitude,
+             s_cfg.offset_tenths / 10, abs(s_cfg.offset_tenths % 10),
              s_cfg.remote[0] != '\0' ? s_cfg.remote : "-");
     return ESP_OK;
 }
@@ -226,6 +242,12 @@ const char *netcfg_remote(void)
 {
     load_once();
     return s_cfg.remote;
+}
+
+int netcfg_temp_offset_tenths(void)
+{
+    load_once();
+    return s_cfg.offset_tenths;
 }
 
 /* One byte of a host name: lower case letters and digits stay, everything else

@@ -100,6 +100,9 @@ laufen – die Sonnenzeiten-Abfrage läuft in dieser Zeit nicht:
 | Access Point (Netzwerkschnittstelle, DHCP-Server) | ~8 KB |
 | HTTP-Server der Einrichtung (Task-Stack 6 KB, 3 Sockets) | ~15 KB |
 | mDNS-Responder | 5,5 KB |
+| zweiter Webserver (Port 8080, 4-KB-Stack, 2 Sockets) | ~8 KB |
+| **frei mit beiden Servern und mDNS** | **~108 KB**, größter Block 57 KB |
+| **frei im Konfigurationsmodus** (AP, DNS, Scan, Server, Anzeige läuft) | **~97 KB**, größter Block 40 KB |
 | HTML-Seite (Heap, nur während einer Anfrage) | 6 KB |
 
 ### Layout einstellen – [main/layout.h](main/layout.h)
@@ -137,6 +140,9 @@ Zeilenhöhen, der Block wird darin automatisch mittig gesetzt.
 | `LAYOUT_INFO_TIME_CAP` | Ziffernhöhe der Zeile `dd.mm. hh:mm` | 18 |
 | `LAYOUT_INFO_GAP` | Abstand zwischen den Zeilen | 8 |
 | `LAYOUT_INFO_MIN_SQUEEZE` | stärkste Stauchung je Zeile; greift sie nicht, wird die Zeile kleiner | 0.6 |
+| `LAYOUT_OUT_TEMP_BASELINE_Y` | Grundlinie der Außentemperatur-Zeile | 180 |
+| `LAYOUT_OUT_TEMP_CAP` | Versalhöhe dieser Zeile | 24 |
+| `LAYOUT_OUT_TEMP_PREFIX` | Text davor (`""` = nur die Zahl) | `"außen "` |
 | `LAYOUT_CONFIG_TRIGGER_X/Y/W/H` | Rechteck, das den Konfigurationsmodus öffnet (Ecke oben rechts) | 180, 0, 60, 60 |
 | `LAYOUT_CONFIG_HOLD_MS` | so lange muss der Finger dort liegen | 500 |
 | `LAYOUT_CONFIG_BACK_Y/H` | Zurück-Schaltfläche, volle Breite | 264, 56 |
@@ -191,7 +197,7 @@ die Werte überleben den Neustart im NVS.
 
 | Auslöser | Bedingung |
 |---|---|
-| Netzwerk nicht erreichbar | SSID nicht im Scan **oder** schwächer als `CONNECT_MIN_RSSI` (-85 dBm) → Verbindungsversuch wird übersprungen; sonst Verbindungsversuch, und wenn der scheitert, ebenfalls Konfigurationsmodus |
+| Netzwerk nicht erreichbar | Verbindungsversuch mit dem **stärksten Access Point** (siehe unten); scheitert er, startet der Konfigurationsmodus |
 | Finger im Eck | Rechteck `LAYOUT_CONFIG_TRIGGER_*` in [layout.h](main/layout.h) = x 180…239, y 0…59, **500 ms halten** (`LAYOUT_CONFIG_HOLD_MS`), damit ein Streifen nicht umschaltet |
 
 Der Bildschirm zeigt dann Hotspot-Name, Passwort und Adresse:
@@ -242,8 +248,36 @@ im NVS steht, gilt das:
 | `ssid`, `pass` | WLAN-Zugang |
 | `lat`, `lon` | Koordinaten als Text (Dezimalgrad) |
 | `name` | Gerätename, Vorgabe `CONNECT_DEVICE_NAME` = `Raumthermometer` |
-| `remote` | IP-Adresse des Außensensors, leer = keiner (wird noch nicht abgefragt) |
+| `remote` | IP oder Name des Außensensors, leer = keiner |
+| `off` | Temperatur-Offset in Zehntelgrad (Ganzzahl, `-15` = −1,5 °C) |
 | `skip` | 1 = Konfigurationsmodus beim Start nicht automatisch öffnen |
+
+### Verbindungsaufbau: der stärkste Access Point gewinnt
+
+Mesh-Repeater und Dual-Band-Router melden denselben Namen mehrfach – der Treiber
+sucht sich aber nicht zuverlässig den stärksten aus. Deshalb scannt
+[wifi.c](main/wifi.c) vor dem Verbinden alle BSSIDs und bindet die Verbindung an
+den stärksten Eintrag:
+
+```
+I (8066) cyd: scan: "FRITZ!Box 7590 j.oe" 2c:91:ab:5e:e5:6a channel 1, -45 dBm
+I (8066) cyd: scan: "FRITZ!Box 7590 j.oe" 3c:37:12:56:48:bb channel 6, -62 dBm
+I (8096) cyd: "FRITZ!Box 7590 j.oe" strongest at -45 dBm
+I (8096) cyd: using the strongest access point of "FRITZ!Box 7590 j.oe"
+```
+
+* `wifi_scan_all()` liefert **jede** BSSID einzeln (die Auswahlliste der
+  Einrichtungsseite fasst gleiche Namen weiterhin zusammen).
+* `wifi_connect_bssid()` setzt `sta.bssid_set` und verbindet gezielt dorthin.
+* **Ausfall:** Antwortet dieser Access Point nicht mehr, löst der
+  Disconnect-Handler die Bindung (`choosing freely again`) und lässt den Treiber
+  neu wählen – statt aufzugeben.
+* **Kein Abbruch wegen schwachem Signal mehr:** `CONNECT_MIN_RSSI` (-85 dBm) ist
+  nur noch ein Hinweis im Log (`is weak … - trying anyway`). Vorher wurde der
+  Verbindungsversuch ganz übersprungen, was eine Unit mit knappem Empfang
+  unnötig in den Konfigurationsmodus schickte.
+* Nach dem Verbinden steht im JSON, **welcher** Access Point es geworden ist
+  (`ssid`, `bssid`, `channel`).
 
 ### Der Gerätename
 
@@ -292,14 +326,53 @@ warnt dann (`#warning "APP_FORCE_CONFIG is 1 ..."`), und im Log steht eine
 
 ### Die Seite selbst
 
-Der HTTP-Server (`esp_http_server`) läuft auf Port 80 mit drei Sockets und 6 KB
-Task-Stack; die Seite wird pro Anfrage in einem 6-KB-Heap-Puffer zusammengesetzt
-und danach wieder freigegeben. **Port 80 ist auch der Messwert-Endpunkt** –
-deshalb stoppt der Konfigurationsmodus ihn zuerst (`webserver_stop()`, Logzeile
-`readings endpoint stopped`). Sonst würde `http://192.168.4.1` weiterhin die
-Messwertseite zeigen, weil beide Server auf demselben Port lauschen. Der Access Point läuft im Modus **APSTA**: die
-Station-Schnittstelle ist zwar nicht verbunden, wird aber für den Scan gebraucht.
-Gescannt wird beim Start des Modus; „neu suchen“ scannt erneut.
+Der HTTP-Server (`esp_http_server`) läuft auf Port 80 mit vier Sockets und
+8 KB Task-Stack; die Seite wird pro Anfrage in einem 6-KB-Heap-Puffer
+zusammengesetzt und danach wieder freigegeben. **Port 80 ist auch der
+Messwert-Endpunkt** – deshalb stoppt der Konfigurationsmodus ihn zuerst
+(`webserver_stop()`, Logzeile `readings endpoint stopped`). Sonst würde
+`http://192.168.4.1` weiterhin die Messwertseite zeigen, weil beide Server auf
+demselben Port lauschen.
+
+### DNS-Antworter und die Anmelde-Prüfungen der Handys
+
+Ein Handy prüft nach dem Verbinden, ob das Netz Internet hat: erst eine
+DNS-Abfrage (Android nach `connectivitycheck.gstatic.com`), dann ein HTTP-Abruf
+(`/generate_204`, `/hotspot-detect.html`, `/ncsi.txt`). Ohne Antworten markiert
+es das WLAN als „kein Internet“, zeigt ein Ausrufezeichen und schickt den
+Datenverkehr über Mobilfunk – die Einrichtungsseite ist dann nicht mehr
+erreichbar.
+
+Deshalb läuft im Konfigurationsmodus ein **minimaler DNS-Server**
+([configmode.c](main/configmode.c), `dns_task`): Er beantwortet **jeden** Namen
+mit der Adresse des Access Points, und der Access Point wird den Clients als DNS
+Server angeboten (`esp_netif_set_dns_info`). Die Prüfabrufe beantwortet der
+Webserver wie ein funktionierendes Internet:
+
+| Pfad | Antwort | für |
+|---|---|---|
+| `/generate_204`, `/gen_204` | `204 No Content` | Android, Chrome |
+| `/hotspot-detect.html`, `/library/test/success.html` | `Success`-Seite | Apple |
+| `/connecttest.txt`, `/ncsi.txt` | `Microsoft Connect Test` / `Microsoft NCSI` | Windows |
+| alles andere | `302` auf `/` | Tippfehler, beliebige Adressen |
+
+Damit bleibt das Handy im Unit-Netz, und der Browser landet zuverlässig auf dem
+Formular (`httpd_uri_match_wildcard` ist dafür aktiviert).
+
+### Hintergrund-Scan und Neustart nach 15 Minuten
+
+* Der Netzwerk-Scan läuft in einer eigenen Task alle
+  `CONFIGMODE_SCAN_INTERVAL_MS` (20 s). Er wechselt kurz den Kanal und würde die
+  Seite sonst sekundenlang blockieren; so antwortet sie sofort.
+  „Netzwerke neu suchen“ setzt nur ein Flag, der Scan startet dann gleich neu.
+* War **15 Minuten** kein Client verbunden und wurde nichts gespeichert
+  (`CONFIGMODE_IDLE_RESTART_MS`), startet die Unit neu und versucht wieder das
+  gespeicherte Netz. Sonst bliebe eine bereits montierte Unit für immer im
+  Access Point, wenn beim Einschalten kurz kein Empfang war. Client-Verbinden
+  und jeder Seitenaufruf setzen die Uhr zurück.
+* Der Modus beendet auch die Netzwerk-Task (`configuration mode active, the
+  network task stops`) – NTP- und HTTPS-Versuche ohne Verbindung wären nur
+  Lograuschen.
 
 ## WLAN, Uhrzeit und Sonnenzeiten – [main/connect.h](main/connect.h), [main/wifi.c](main/wifi.c), [main/clock.c](main/clock.c), [main/sun.c](main/sun.c)
 
@@ -412,10 +485,13 @@ kostet eine Abfrage weder I2C-Zeit noch einen Bild-Neuaufbau.
 | `GET /api/values` | JSON, gedacht für andere Geräte und Skripte |
 | `GET /api` | dasselbe (kurze Form) |
 | `GET /` | kleine Seite f?r den Browser, aktualisiert sich alle 10 s |
+| `http://…:8080/` | **zweiter Server, nur die Seite** – kein JSON (siehe unten) |
 
 ```json
-{"valid":true,"temperature_c":23.3,"humidity_rh":48.0,"pressure_hpa":970.0,
- "age_s":9,"time":"18.10. 22:21","ip":"192.168.123.122","rssi_dbm":-43,"uptime_s":14}
+{"name":"Thermometer Küche","valid":true,"temperature_c":22.6,"humidity_rh":39.0,
+ "pressure_hpa":963.8,"offset_c":-1.5,"age_s":7,"time":"24.10. 23:12",
+ "ip":"192.168.123.192","rssi_dbm":-52,"uptime_s":23,"ssid":"FRITZ!Box 7590 j.oe",
+ "bssid":"2c:91:ab:5e:e5:6a","channel":1,"remote":""}
 ```
 
 | Feld | Bedeutung |
@@ -427,10 +503,27 @@ kostet eine Abfrage weder I2C-Zeit noch einen Bild-Neuaufbau.
 | `time` | Ortszeit `dd.mm. hh:mm`; vor der NTP-Antwort der R?ckfallwert `01.01. 00:00` |
 | `ip`, `rssi_dbm`, `uptime_s` | Adresse, Funkfeldst?rke, Laufzeit seit dem Start |
 | `remote` | eingestellte Adresse des Außensensors, `""` = keine |
+| `outdoor_c` | Temperatur, die dieses Gerät vom Außensensor geholt hat, `null` solange keine |
+| `offset_c` | eingestellter Temperatur-Offset (siehe [Temperatur kalibrieren](#temperatur-kalibrieren-offset)) |
+| `ssid`, `bssid`, `channel` | Access Point, mit dem die Unit verbunden ist – im Mesh teilen sich mehrere die SSID, die BSSID sagt welcher |
 
 Die IP-Adresse steht im Log (`webserver: readings at http://?/api/values`) und
 auf der Seite selbst; im Router heißt das Gerät `raumthermometer`
 (`CONNECT_HOSTNAME`).
+
+### Zwei Server: Port 80 für alles, Port 8080 nur für die Seite
+
+`WEBSERVER_PUBLIC_PORT` in [main/webserver.h](main/webserver.h) (Standard 8080)
+startet einen zweiten HTTP-Server, der **ausschließlich `/` kennt**. Wer diesen
+Port im Router nach außen weiterleitet, gibt damit nur die Anzeigeseite frei:
+`/api/values` existiert dort überhaupt nicht und antwortet mit 404 – ein
+versehentlich mitveröffentlichter JSON-Endpunkt ist so ausgeschlossen. Die Seite
+auf 8080 lässt außerdem den Hinweis auf den JSON-Pfad weg. Port 80 bleibt der
+vollständige Server im lokalen Netz.
+
+Beide Server werden gemeinsam gestartet (`webserver_start()`) und gemeinsam
+gestoppt (`webserver_stop()`), bevor der Konfigurationsmodus Port 80 übernimmt.
+Auf 0 gesetzt bleibt der zweite Server aus und spart ~8 KB Heap.
 
 ### Am PC testen
 
@@ -487,6 +580,87 @@ selben Netz (kein Portforwarding). Der Name im Router bleibt stabil, auch wenn s
 die IP per DHCP ändert – deshalb in Skripten lieber den Namen verwenden. Klappt die
 Namensauflösung nicht (anderer Router, Gästenetz), im Router nachsehen, unter
 welcher IP und welchem Namen `thermometer-kueche` steht.
+
+## Temperatur kalibrieren (Offset) - [main/netcfg.c](main/netcfg.c), [main/sensor.c](main/sensor.c)
+
+Der BME280 sitzt im Gehäuse und misst deshalb etwas zu warm. Statt im Code zu
+rechnen, lässt sich ein Offset auf der Einrichtungsseite
+(`http://192.168.4.1`, Feld **Temperatur-Offset in °C**) eintragen:
+
+| Punkt | Wert |
+|---|---|
+| Eingabe | Dezimalkomma **oder** Punkt, `-0,5` und `-0.5` sind gleichwertig |
+| Bereich | −5,0 bis +5,0 °C, in 0,1-Schritten; leer oder `0` = keine Korrektur |
+| Ablage | NVS-Schlüssel `off` (Namespace `net`) als Ganzzahl in Zehntelgrad |
+| Wirkung | `sensor_read()` addiert den Wert auf **jeden** Messwert |
+
+Weil die Korrektur in [main/sensor.c](main/sensor.c) direkt nach dem Auslesen
+passiert, zeigen TFT-Anzeige, JSON-Endpunkt und der Messwertspeicher denselben
+Wert – es gibt keine Stelle, die den Offset vergessen könnte. Das JSON führt den
+Offset zusätzlich als `offset_c`, damit ein Skript Roh- und Anzeigewert
+auseinanderhalten kann.
+
+Beim Speichern wird der Wert auf ganze Zehntel gerundet (kaufmännisch), damit
+`0,04` nicht zu `0,0` wird. Der Log bestätigt die Übernahme:
+
+```
+I (507) netcfg: stored "Thermometer Küche": WLAN "FRITZ!Box 7590 j.oe", location …, offset -1.5 C, outdoor sensor -
+I (5406) cyd: device name "Thermometer Küche", offset -1.5 C, outdoor sensor not set
+I (5716) bigdigit: "22,5" cap 120 px …
+```
+
+**Wichtig beim Ändern:** Das Passwortfeld ist beim Öffnen der Seite immer leer.
+Wer nur den Offset ändert, lässt es leer – bei unveränderter SSID bleibt dann das
+gespeicherte Passwort erhalten (`web: password empty on an unchanged network,
+keeping the stored one`). Wird dagegen eine **andere** SSID gewählt, gilt ein
+leeres Feld als offenes Netz.
+
+## Außentemperatur vom Partnergerät - [main/outdoor.c](main/outdoor.c)
+
+Ein zweites Thermometer im Netz (der SHT31-Sensor, siehe
+[PORTING.md](PORTING.md)) liefert seine Werte unter `GET /api/values`. Diese
+Unit holt dort die Temperatur ab und zeigt sie unter der Raumtemperatur an.
+
+```
+I (12897) outdoor: aussenthermometer.local: 5,8 C
+I (17907) outdoor: line "außen 5,8°": cap 24 px, baseline y=180, 164 px wide
+```
+
+| Punkt | Wert |
+|---|---|
+| Adresse | NVS-Schlüssel `remote`, Feld **Außensensor** der Einrichtungsseite |
+| erlaubt | IP (`192.168.123.191`) **oder** Name (`aussenthermometer.local`) |
+| Abfrage | `http://<remote>/api/values`, alle `OUTDOOR_REFRESH_S` (60 s) |
+| Timeout | `OUTDOOR_TIMEOUT_MS`, 5 s - ein stummes Partnergerät blockiert nichts |
+| Feld | `temperature_c`, nur wenn dort `"valid":true` steht |
+| Ablage | Cache mit Zeitstempel, gelesen von der Anzeige-Task (kein Warten auf Netz) |
+
+Weil der Wert nur im Cache liegt, zeichnet die Anzeige unabhängig vom Netz weiter;
+die Netzwerk-Task aktualisiert im Hintergrund. Erst wenn `remote` leer ist,
+passiert gar nichts - dann bleibt die Zeile einfach weg.
+
+### Aussehen und Position
+
+Alle Werte stehen in [main/layout.h](main/layout.h):
+
+| Makro | Bedeutung | aktuell |
+|---|---|---|
+| `LAYOUT_OUT_TEMP_BASELINE_Y` | Grundlinie der Zeile | 180 |
+| `LAYOUT_OUT_TEMP_CAP` | Versalhöhe - so groß wie die Feuchtigkeitszeile | 24 |
+| `LAYOUT_OUT_TEMP_PREFIX` | Text vor der Zahl, `""` für die nackte Zahl | `"außen "` |
+| `LAYOUT_OUT_TEMP_MAX_WIDTH` | breiteste erlaubte Zeile | 190 |
+| `LAYOUT_OUT_TEMP_MIN_SQUEEZE` | stärkste Stauchung | 0.6 |
+
+Die Zeile ist horizontal um `BOARD_SCREEN_WIDTH / 2` (x=120) zentriert. Mit
+Grundlinie 180 und Versalhöhe 24 reicht ihr Tintenbereich von y=156 bis y=180 -
+die **oberen 4 Zeilen liegen noch im ersten Band**. Das ist unkritisch, weil jedes
+Band das ganze Bild malt und nur die Zeilen außerhalb abschneidet; im Log sieht man
+es an den Textpixeln beider Bänder. Nur die Grundlinie genau auf eine Bandgrenze
+(160/320) legen sollte man nicht.
+
+Das JSON dieser Unit führt den geholten Wert als `outdoor_c` mit (oder `null`,
+solange keiner da ist) - praktisch für eine Wetterstation, die nur die
+Raumgeräte abfragt.
 
 ## mDNS: Erreichbarkeit ohne Router-DNS – [main/discovery.c](main/discovery.c)
 
@@ -892,6 +1066,29 @@ Zum Testen ohne Hardware genügt `.\idf build` – es ist bereits erfolgreich
 durchgelaufen (App-Binärdatei 966 KB inklusive 147 KB Schrift und WiFi-Stack in
 einer 3008-KB-Partition, Flash 4 MB, CPU 240 MHz).
 
+## Watchdog - [main/watchdog.c](main/watchdog.c)
+
+Ein hängender Task startet die Unit neu, statt sie tot stehen zu lassen. Der
+Watchdog läuft mit **60 s**, ein Timeout erzeugt einen Panic (Backtrace im Log)
+und einen Neustart; der nächste Start protokolliert dann den Grund.
+
+| Punkt | Wert |
+|---|---|
+| Timeout | 60 s (`WATCHDOG_TIMEOUT_MS`) |
+| Überwacht | nur Tasks, die sich mit `watchdog_subscribe()` anmelden |
+| Idle-Tasks | **nicht** überwacht (`idle_core_mask = 0`), damit lange Flash-Operationen nicht auslösen |
+| Angemeldet | Anzeige-Task, Scan-Task und die Schleife des Konfigurationsmodus |
+
+```c
+watchdog_init();        /* app_main, direkt nach netcfg_init() */
+watchdog_subscribe();   /* im Task, der überwacht werden soll */
+watchdog_feed();        /* mindestens alle 60 s */
+```
+
+Die Anzeige-Task ruft `watchdog_feed()` in ihrem 100-ms-Takt, der Hintergrund-Scan
+in 500-ms-Schritten. Damit fällt auf, wenn Zeichnen, JPEG-Dekodierung oder der
+Webserver hängen – früher blieb das Bild einfach stehen.
+
 ## Projektstruktur
 
 | Datei | Zweck |
@@ -916,7 +1113,9 @@ einer 3008-KB-Partition, Flash 4 MB, CPU 240 MHz).
 | [main/netcfg.c](main/netcfg.c), [main/netcfg.h](main/netcfg.h) | WLAN-Daten und Koordinaten im NVS: laden, speichern, `netcfg_sun_url()` |
 | [main/webserver.c](main/webserver.c), [main/webserver.h](main/webserver.h) | Dauerhafter HTTP-Server im Heimnetz: `GET /api/values` (JSON), `GET /` (Browserseite) |
 | [main/discovery.c](main/discovery.c), [main/discovery.h](main/discovery.h) | mDNS: `<hostname>.local` und `_http._tcp`, in jedem Netz ohne Router-DNS |
+| [main/watchdog.c](main/watchdog.c), [main/watchdog.h](main/watchdog.h) | Task-Watchdog: 60 s, Panic und Neustart, nur für angemeldete Tasks |
 | [main/textutil.c](main/textutil.c), [main/textutil.h](main/textutil.h) | Maskierung für HTML und JSON (Konfigurationsseite, Messwert-Endpunkt) |
+| [main/outdoor.c](main/outdoor.c), [main/outdoor.h](main/outdoor.h) | Außentemperatur vom Partnergerät holen (HTTP, alle 60 s) und unter der Raumtemperatur anzeigen |
 | [main/gfx.c](main/gfx.c), [main/gfx.h](main/gfx.h) | Mini-Grafikbibliothek: Canvas (auch als Band), Rechtecke, Linien, Kreis, Text, Flush |
 | [main/gfx_color.h](main/gfx_color.h) | RGB565-Farbmakros, ohne ESP-IDF-Abhängigkeit (auch für Datentabellen nutzbar) |
 | [main/font5x7.c](main/font5x7.c), [main/font5x7.h](main/font5x7.h) | 5×7-Pixel-Font (A–Z, 0–9, Satzzeichen), generiert |
@@ -1029,6 +1228,17 @@ weiter.
 | Speichern quittiert mit 400 | Meldung auf der Seite lesen: Passwort 1–7 Zeichen (WPA2 braucht mindestens 8), SSID leer/zu lang, oder Koordinaten außerhalb −90…90 bzw. −180…180 |
 | Nach „Speichern“ passiert nichts | Das Gerät startet nach 1,5 s neu (`configmode: restarting with the new settings`); die Seite verliert dabei die Verbindung. Am TFT erscheint wieder die Anzeige |
 | `http://?/api/values` antwortet nicht | Der Endpunkt läuft erst nach erfolgreicher Anmeldung im Heimnetz (`webserver: readings at ?` im Log). IP prüfen, Port 80 nicht von einer Firewall blockiert, Gerät und PC im selben Netz |
+| Handy zeigt „kein Internet“ und öffnet die Seite nicht | Der DNS-Antworter oder die Prüfantworten fehlen. Im Log müssen `DNS: every name answers with …` und `connectivity check … -> 204` stehen; `dns_task` braucht einen freien UDP-Port 53 |
+| Einrichtung springt nach 15 Minuten zurück | Kein Client verbunden und nichts gespeichert (`CONFIGMODE_IDLE_RESTART_MS`). Das ist Absicht – Handy verbinden oder speichern |
+| „Temperatur-Offset ungültig“ trotz gültiger Zahl | Komma **und** Punkt werden akzeptiert; erlaubt sind −5,0 bis +5,0 in 0,1-Schritten. Prüfen, ob ein Leerzeichen mitkopiert wurde |
+| Offset wirkt nicht | Der Wert wird beim **Speichern** übernommen, die Unit startet neu. Im Log `offset -1.5 C` in der Zeile `device name …` prüfen |
+| Nach dem Ändern nur des Offsets verbindet die Unit nicht mehr | War ein Fehler: ein leeres Passwortfeld hat das gespeicherte Passwort gelöscht. Jetzt bleibt es bei unveränderter SSID erhalten (`web: password empty on an unchanged network`) |
+| `reset: task watchdog` im Log | Eine angemeldete Task hat 60 s nicht gefeedet – Backtrace im Log darüber zeigt, wo sie hing. Nicht die Ursache wegdrücken, sondern die Stelle suchen |
+| Port 8080 antwortet nicht | `WEBSERVER_PUBLIC_PORT` steht auf 0, oder der Port ist im lokalen Netz von einer Firewall gesperrt. `page for outside at http://…:8080/` im Log prüfen |
+| Unit verbindet sich mit dem schwächeren Repeater | Sollte nicht mehr passieren: der stärkste BSSID wird gewählt. Im Log zeigt `scan:` alle Kandidaten, `using the strongest` den gewählten; `bssid` im JSON nennt den tatsächlich benutzten |
+| Keine Außentemperatur auf der Anzeige | Feld **Außensensor** ist leer (Log: `outdoor sensor not set`). Adresse eintragen - IP oder `<name>.local` - und speichern |
+| `no outdoor temperature from …` im Log | Das Partnergerät antwortet nicht: Adresse prüfen (`curl http://<adresse>/api/values` am PC), gleiches Netz vorausgesetzt. Die Zeile bleibt dann weg, die Anzeige läuft weiter |
+| Außentemperatur springt auf `--` bzw. verschwindet | Das Partnergerät meldet `"valid":false` (eigener Sensorfehler) - der Wert wird bewusst nicht übernommen |
 | `<hostname>.local` wird nicht aufgelöst | mDNS fehlt beim Client: unter Windows beide Dienste prüfen (`Dnscache`/`fdPHost`), unter Android erst ab Version 12 vorhanden, manche Firmennetze blockieren Multicast. Im Log steht `discovery: announced as http://….local/`; sonst Router-Hostname oder IP nutzen |
 | `192.168.4.1` zeigt die Messwertseite statt der Einrichtung | War ein Fehler: Messwert- und Einrichtungs-Server lauschten beide auf Port 80. Behoben durch `webserver_stop()` beim Eintritt in den Konfigurationsmodus – im Log muss `readings endpoint stopped` vor `access point` stehen |
 | `Nothing matches the given URI` | Pfad falsch: genau `/api/values`, `/api` oder `/`. Der Server im Konfigurationsmodus kennt diese Pfade nicht |
@@ -1132,10 +1342,9 @@ Abhängigkeiten selbst nach. `sdkconfig.defaults` wirkt nur bei neu erzeugter
 12. ~~HTTP-Endpunkt mit JSON~~ – erledigt: `GET /api/values` über
     [main/webserver.c](main/webserver.c), gespeist aus dem Messwertspeicher in
     [main/sensor.c](main/sensor.c)
-14. Außentemperatursensor abfragen: das Feld für seine IP-Adresse steht
-    bereits im Einrichtungsdialog und im NVS (`remote`). Fehlt noch: eine Schleife im
-    Netzwerkteil, die `http://<remote>/api/values` liest, und eine Einblendung in der
-    Mitte der Anzeige bei Touch dortselbst
+14. ~~Außentemperatursensor abfragen~~ – erledigt: `outdoor.c` holt den Wert alle 60 s
+    und zeigt ihn unter der Raumtemperatur an
+15. Mehrere Außensensoren / Räume gleichzeitig (für die Wetterstation)
 
 Optional, nicht für das Raumthermometer nötig:
 

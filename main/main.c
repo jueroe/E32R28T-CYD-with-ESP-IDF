@@ -13,8 +13,10 @@
  * removed from the project altogether.
  */
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "sdkconfig.h"
@@ -44,6 +46,7 @@
 #include "infotile.h"
 #include "layout.h"
 #include "netcfg.h"
+#include "outdoor.h"
 #include "sensor.h"
 #include "statusled.h"
 #include "storage.h"
@@ -52,6 +55,7 @@
 #include "touch.h"
 #include "ttf.h"
 #include "wallpaper.h"
+#include "watchdog.h"
 #include "webserver.h"
 #include "wifi.h"
 
@@ -234,6 +238,7 @@ static int s_shown_tenths;
 static int s_shown_humidity_tenths;
 static int s_shown_pressure_whole;
 static int s_shown_clock;
+static int s_shown_outdoor_tenths; /* INT_MIN until the partner unit answered */
 
 /* How many bands still report their text pixel count at boot (diagnostics) */
 static int s_text_log_budget = 6;
@@ -264,11 +269,24 @@ static void info_values_from(const sensor_reading_t *reading, infotile_values_t 
     shown_time(&info->day, &info->month, &info->hour, &info->minute);
 }
 
-/* Comparable number of the displayed date/time, so a redraw happens exactly
+/* Comparable number of the shown date/time, so a redraw happens exactly
  * when the minute changes */
 static int clock_key(const infotile_values_t *info)
 {
     return ((info->month * 32 + info->day) * 24 + info->hour) * 60 + info->minute;
+}
+
+/* Comparable number of the outdoor temperature shown, or OUTDOOR_KEY_NONE while
+ * the partner unit has not answered yet */
+#define OUTDOOR_KEY_NONE INT_MIN
+
+static int outdoor_key(void)
+{
+    float temperature = 0.0f;
+    if (!outdoor_last(&temperature, NULL)) {
+        return OUTDOOR_KEY_NONE;
+    }
+    return (int)lroundf(temperature * 10.0f);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -357,6 +375,7 @@ static esp_err_t draw_thermometer(int tenths, const infotile_values_t *info)
                                     LAYOUT_TEMP_MAX_WIDTH, tenths, s_text_color);
         bigdigit_draw_degree(&s_canvas, LAYOUT_TEMP_DEGREE_X, LAYOUT_TEMP_DEGREE_Y,
                              LAYOUT_TEMP_DIGIT_HEIGHT, s_text_color);
+        outdoor_draw(&s_canvas, s_text_color);
         infotile_draw(&s_canvas, info, s_text_color);
 
         const uint32_t text_pixels = count_text_pixels(&s_canvas, s_text_color);
@@ -389,6 +408,8 @@ static void thermometer_task(void)
     sensor_reading_t reading = {0};
     infotile_values_t info;
 
+    watchdog_subscribe();
+
     /* season and time of day decide the slot, the image is picked at random */
     wallpaper_update();
 
@@ -400,6 +421,7 @@ static void thermometer_task(void)
     s_shown_pressure_whole = (int)lroundf(reading.pressure_hpa);
     info_values_from(&reading, &info);
     s_shown_clock = clock_key(&info);
+    s_shown_outdoor_tenths = outdoor_key();
 
     if (draw_thermometer(s_shown_tenths, &info) != ESP_OK) {
         ESP_LOGE(TAG, "could not draw the thermometer screen");
@@ -412,6 +434,7 @@ static void thermometer_task(void)
         for (int tick = 0; tick < SENSOR_INTERVAL_S * (1000 / APP_TICK_MS) && !enter_config;
              tick++) {
             vTaskDelay(pdMS_TO_TICKS(APP_TICK_MS));
+            watchdog_feed();
             enter_config = configmode_requested() || configmode_corner_touched();
         }
         if (enter_config) {
@@ -423,11 +446,13 @@ static void thermometer_task(void)
         bool redraw = wallpaper_update();
         info_values_from(&reading, &info);
         const int clock_now = clock_key(&info);
+        const int outdoor_now = outdoor_key();
 
         if (!sensor_is_available() || sensor_read(&reading) != ESP_OK) {
             ESP_LOGW(TAG, "sensor read failed");
-            if (redraw || clock_now != s_shown_clock) {
+            if (redraw || clock_now != s_shown_clock || outdoor_now != s_shown_outdoor_tenths) {
                 s_shown_clock = clock_now;
+                s_shown_outdoor_tenths = outdoor_now;
                 if (draw_thermometer(s_shown_tenths, &info) != ESP_OK) {
                     ESP_LOGW(TAG, "redraw failed");
                 }
@@ -444,13 +469,15 @@ static void thermometer_task(void)
         const int humidity_tenths = (int)lroundf(reading.humidity_rh * 10.0f);
         const int pressure_whole = (int)lroundf(reading.pressure_hpa);
         if (!redraw && tenths == s_shown_tenths && humidity_tenths == s_shown_humidity_tenths &&
-            pressure_whole == s_shown_pressure_whole && clock_now == s_shown_clock) {
+            pressure_whole == s_shown_pressure_whole && clock_now == s_shown_clock &&
+            outdoor_now == s_shown_outdoor_tenths) {
             continue;
         }
         s_shown_tenths = tenths;
         s_shown_humidity_tenths = humidity_tenths;
         s_shown_pressure_whole = pressure_whole;
         s_shown_clock = clock_now;
+        s_shown_outdoor_tenths = outdoor_now;
         info_values_from(&reading, &info);
         if (draw_thermometer(tenths, &info) != ESP_OK) {
             ESP_LOGW(TAG, "redraw failed");
@@ -471,26 +498,52 @@ static void network_task(void *argument)
     netcfg_t cfg;
     const bool stored = netcfg_load(&cfg);
     ESP_LOGI(TAG, "WLAN \"%s\" from %s", cfg.ssid, stored ? "NVS" : "connect.h");
-    ESP_LOGI(TAG, "device name \"%s\", outdoor sensor %s", cfg.name,
+    ESP_LOGI(TAG, "device name \"%s\", offset %d.%d C, outdoor sensor %s", cfg.name,
+             cfg.offset_tenths / 10, abs(cfg.offset_tenths % 10),
              cfg.remote[0] != '\0' ? cfg.remote : "not set");
 
+    bool connected = false;
     if (wifi_init() != ESP_OK) {
         ESP_LOGE(TAG, "WiFi driver did not come up, continuing without network");
         vTaskDelete(NULL);
         return;
     }
 
-    /* Look for the network first: when it is not there, the connection attempt
-     * would only cost the full timeout before the configuration starts. */
-    bool connected = false;
-    const int rssi = wifi_scan_rssi(cfg.ssid);
-    if (rssi == WIFI_RSSI_NOT_FOUND) {
-        ESP_LOGW(TAG, "\"%s\" is not in the scan result", cfg.ssid);
-    } else if (rssi < CONNECT_MIN_RSSI) {
-        ESP_LOGW(TAG, "\"%s\" is too weak: %d dBm, at least %d dBm needed", cfg.ssid, rssi,
-                 CONNECT_MIN_RSSI);
+    /* Every access point of the network is logged with its own strength: a mesh
+     * runs several with the same name, and the driver does not always pick the
+     * strongest.  The best one is then used explicitly.  A weak signal is no
+     * reason to give up any more - it is only reported. */
+    wifi_bss_t access_points[16];
+    const int found = wifi_scan_all(access_points, 16);
+    const uint8_t *best_bssid = NULL;
+    int best_rssi = WIFI_RSSI_NOT_FOUND;
+
+    for (int i = 0; i < found; i++) {
+        const wifi_bss_t *ap = &access_points[i];
+        ESP_LOGI(TAG, "scan: \"%s\" %02x:%02x:%02x:%02x:%02x:%02x channel %d, %d dBm", ap->ssid,
+                 ap->bssid[0], ap->bssid[1], ap->bssid[2], ap->bssid[3], ap->bssid[4],
+                 ap->bssid[5], ap->channel, ap->rssi);
+        if (strcmp(ap->ssid, cfg.ssid) == 0 && ap->rssi > best_rssi) {
+            best_rssi = ap->rssi;
+            best_bssid = ap->bssid;
+        }
+    }
+
+    if (best_bssid == NULL) {
+        ESP_LOGW(TAG, "\"%s\" is not in the scan result - trying anyway", cfg.ssid);
+    } else if (best_rssi < CONNECT_MIN_RSSI) {
+        ESP_LOGW(TAG, "\"%s\" is weak (%d dBm, below the %d dBm guideline) - trying anyway",
+                 cfg.ssid, best_rssi, CONNECT_MIN_RSSI);
     } else {
-        ESP_LOGI(TAG, "\"%s\" found with %d dBm", cfg.ssid, rssi);
+        ESP_LOGI(TAG, "\"%s\" strongest at %d dBm", cfg.ssid, best_rssi);
+    }
+
+    if (best_bssid != NULL) {
+        ESP_LOGI(TAG, "using the strongest access point of \"%s\"", cfg.ssid);
+        connected =
+            wifi_connect_bssid(cfg.ssid, cfg.password, best_bssid, CONNECT_WIFI_TIMEOUT_MS);
+    }
+    if (!connected) {
         connected = wifi_connect(cfg.ssid, cfg.password, CONNECT_WIFI_TIMEOUT_MS);
     }
 
@@ -531,7 +584,7 @@ static void network_task(void *argument)
     if (!clock_wait_for_sync(CONNECT_SNTP_WAIT_MS)) {
         /* the first query can get lost on a busy network; without a retry the
          * clock would stay at 1970 for the next poll interval (1 h) */
-        for (int attempt = 0; attempt < 3; attempt++) {
+        for (int attempt = 0; attempt < 3 && !configmode_requested(); attempt++) {
             ESP_LOGW(TAG, "retrying the NTP query (%d/3)", attempt + 1);
             esp_sntp_restart();
             if (clock_wait_for_sync(CONNECT_SNTP_WAIT_MS)) {
@@ -542,12 +595,40 @@ static void network_task(void *argument)
     clock_log_now();
 
     /* HTTPS needs the correct date for the certificate check, so the sun times
-     * are fetched after the NTP sync and then refreshed every few hours */
+     * are fetched after the NTP sync.  The outdoor temperature is much more
+     * short-lived, so the loop ticks every NETWORK_TICK_S and keeps two
+     * separate schedules. */
+#define NETWORK_TICK_S 30
+    int64_t last_sun = -CONNECT_SUN_REFRESH_S;
+    int64_t last_outdoor = -OUTDOOR_REFRESH_S;
+
     for (;;) {
-        if (sun_fetch() != ESP_OK) {
-            ESP_LOGW(TAG, "sun times not updated, retrying in %d s", CONNECT_SUN_REFRESH_S);
+        if (configmode_requested()) {
+            /* the configuration mode owns the radio now - no point in talking
+             * to servers that are out of reach */
+            ESP_LOGI(TAG, "configuration mode active, the network task stops");
+            vTaskDelete(NULL);
+            return;
         }
-        vTaskDelay(pdMS_TO_TICKS(CONNECT_SUN_REFRESH_S * 1000));
+
+        const int64_t now_s = esp_timer_get_time() / 1000000;
+
+        if (netcfg_remote()[0] != '\0' && now_s - last_outdoor >= OUTDOOR_REFRESH_S) {
+            last_outdoor = now_s;
+            if (outdoor_fetch() != ESP_OK) {
+                ESP_LOGW(TAG, "no outdoor temperature from %s", netcfg_remote());
+            }
+        }
+
+        if (now_s - last_sun >= CONNECT_SUN_REFRESH_S) {
+            last_sun = now_s;
+            if (sun_fetch() != ESP_OK) {
+                ESP_LOGW(TAG, "sun times not updated, retrying in %d s",
+                         CONNECT_SUN_REFRESH_S);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(NETWORK_TICK_S * 1000));
     }
 }
 
@@ -558,11 +639,13 @@ void app_main(void)
              (int)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
              (int)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 
-    /* NVS holds the WLAN data and the location, so it has to be up before the
-     * network task and the configuration mode run */
+    /* NVS holds the WLAN data, the location and the temperature offset, so it
+     * has to be up before anything reads them */
     if (netcfg_init() != ESP_OK) {
         ESP_LOGW(TAG, "NVS not available - the WLAN cannot be configured on the device");
     }
+
+    watchdog_init();
 
     backlight_init();
     backlight_set(0);
@@ -594,6 +677,10 @@ void app_main(void)
 
     if (touch_init() != ESP_OK) {
         ESP_LOGW(TAG, "touch not available");
+    }
+
+    if (outdoor_init() != ESP_OK) {
+        ESP_LOGW(TAG, "the outdoor temperature stays empty");
     }
 
     if (ttf_init_builtin() != ESP_OK) {

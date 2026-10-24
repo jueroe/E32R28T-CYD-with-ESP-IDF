@@ -75,6 +75,12 @@ auszuprobieren. Für neue Projekte: Datei kopieren und den Abschnitt
 
 ## Arbeitsweise
 
+- **Bei größeren Aufgaben die voraussichtliche Dauer ansagen**, bevor die erste
+  Aktion läuft (z. B. „das sind Umbauten an 5 Dateien, bauen + flashen +
+  verifizieren: etwa 10–15 Minuten"). Während der Arbeit kurze Zwischenstände
+  geben („Modul A fertig, jetzt B"), damit niemand rätselt, ob es noch läuft.
+  Ein Abbruch mitten in der Arbeit ist teuer: halb umgestellte Module lassen
+  sich nicht sinnvoll prüfen.
 - Testschalter (`APP_FORCE_CONFIG`, `APP_TEST_CONFIG_AFTER_CONNECT_S`) stehen im
   Repository auf **0**; wenn sie für einen Test auf 1 gesetzt werden, müssen sie
   danach zurück – ein vergessener Schalter hat schon zweimal eine

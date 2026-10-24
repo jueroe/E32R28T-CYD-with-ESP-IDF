@@ -31,14 +31,14 @@
 
 /* Baseline of the big digits, i.e. their bottom edge.  The comma tail and the
  * half size decimal digit end on this line as well. */
-#define LAYOUT_TEMP_BASELINE_Y      160
+#define LAYOUT_TEMP_BASELINE_Y      130 //160
 
 /* The group is condensed horizontally until it fits this width.  The space to
  * the right of it is where the degree sign sits. */
 #define LAYOUT_TEMP_MAX_WIDTH       190
 
 /* Height of the two digits in front of the comma, in pixels */
-#define LAYOUT_TEMP_DIGIT_HEIGHT    120
+#define LAYOUT_TEMP_DIGIT_HEIGHT    100 //120
 
 /* Strongest horizontal squeeze allowed.  If the width would need a stronger
  * squeeze, the digit height is reduced instead so the proportions stay
@@ -60,6 +60,33 @@
  * small by design; 0.5 draws the ring at half the size the font would give at
  * digit height. */
 #define LAYOUT_TEMP_DEGREE_SCALE    0.5f
+
+/* ------------------------------------------------------------------------- */
+/* Outdoor temperature: one centred line under the room temperature          */
+/* ------------------------------------------------------------------------- */
+
+/* Baseline of the line, i.e. the bottom edge of its capital letters.  The room
+ * digits end at LAYOUT_TEMP_BASELINE_Y (130), the info tile starts at
+ * LAYOUT_INFO_Y (205) - 180 leaves a calm band in between.
+ *
+ * The ink starts at baseline - cap height, so with a cap of 24 it begins at
+ * y=156 and the top 4 rows fall into the first band while the rest is in the
+ * second.  That is fine, because every band paints the whole frame and clips
+ * the rows outside itself - just do not put the baseline exactly on a band
+ * border, then the line would be cut in the log output by band. */
+#define LAYOUT_OUT_TEMP_BASELINE_Y  170
+
+/* Cap height, in pixels - the same size as the humidity line in the info tile */
+#define LAYOUT_OUT_TEMP_CAP         24
+
+/* Text in front of the value.  Set to "" for the bare number. */
+#define LAYOUT_OUT_TEMP_PREFIX      "außen "
+
+/* Widest the line may become (the text is condensed if it would be wider) */
+#define LAYOUT_OUT_TEMP_MAX_WIDTH   190
+
+/* Strongest horizontal squeeze; 1.0 = never condense */
+#define LAYOUT_OUT_TEMP_MIN_SQUEEZE 0.6f
 
 /* ------------------------------------------------------------------------- */
 /* Info tile: humidity, pressure and date/time, one line each                */
